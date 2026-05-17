@@ -96,3 +96,10 @@ The tests use Node's built-in test runner with TypeScript type stripping.
     brew install ast-grep
     npm install --g @ast-grep/cli
     ```
+
+
+## TODO
+
+- [ ] Cap autocomplete results to a reasonable number (e.g. 100).
+- [ ] Measure memory usage for in-memory index and optimize. Consider `readtags` based search.
+- [ ] Add support for searching for `<symbol>.<attribute>` references, e.g. `#MyClass.myMethod`.
