@@ -7,13 +7,13 @@ Pi extension that adds `#` symbol autocomplete in the session editor and injects
 From GitHub:
 
 ```bash
-pi install git:github.com/Mathuv/symbol-autocomplete
+pi install git:github.com/Mathuv/pi-symbol-autocomplete
 ```
 
 For local development from this checkout:
 
 ```bash
-pi install /Users/mathu/devel/symbol-autocomplete
+pi install /local/path/to/pi-symbol-autocomplete
 ```
 
 Then run `/reload` in Pi.
@@ -83,6 +83,16 @@ The tests use Node's built-in test runner with TypeScript type stripping.
 
 ## Requirements
 
-- Pi coding agent.
-- Universal Ctags recommended (`ctags` on PATH).
-- ast-grep optional fallback (`ast-grep` on PATH).
+- Pi coding agent - [https://pi.dev/](https://pi.dev/)
+- Universal Ctags recommended (`ctags` on PATH) - [https://github.com/universal-ctags/ctags](https://github.com/universal-ctags/ctags)
+
+    ```bash
+    brew install universal-ctags
+
+    ```
+- ast-grep optional fallback (`ast-grep` on PATH) - [https://github.com/ast-grep/ast-grep](https://github.com/ast-grep/ast-grep)
+
+    ```bash
+    brew install ast-grep
+    npm install --g @ast-grep/cli
+    ```
