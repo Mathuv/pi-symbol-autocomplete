@@ -288,7 +288,174 @@ void describe("disambiguation", () => {
   });
 });
 
-// ── 5. Insertion (stable token) ─────────────────────────────────────
+// ── 5. Dotted queries ────────────────────────────────────────────
+
+void describe("dotted queries", () => {
+  const DOTTED_SYMBOLS: ProjectSymbol[] = [
+    { name: "Campaign", kind: "class", path: "src/models/campaign.ts", line: 1 },
+    { name: "reservation_date", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 42 },
+    { name: "reservation_expiration_date", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 43 },
+    { name: "User", kind: "class", path: "src/models/user.ts", line: 1 },
+    { name: "name", kind: "property", parentName: "User", path: "src/models/user.ts", line: 10 },
+    { name: "email", kind: "property", parentName: "User", path: "src/models/user.ts", line: 15 },
+  ];
+
+  void it("suggests scoped members for prefix parent + fuzzy member", async () => {
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    const result = await provider.getSuggestions(["#Campaign.reservatio"], 0, 20, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.deepEqual(result.items.map((i) => i.label), [
+      "#Campaign.reservation_date",
+      "#Campaign.reservation_expiration_date",
+    ]);
+    assert.equal(
+      result.items[0].value,
+      "#Campaign.reservation_date@src/models/campaign.ts:42",
+    );
+    assert.equal(
+      result.items[1].value,
+      "#Campaign.reservation_expiration_date@src/models/campaign.ts:43",
+    );
+  });
+
+  void it("supports prefix parent + prefix member", async () => {
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    const result = await provider.getSuggestions(["#Camp.reserv"], 0, 12, { signal: signal() });
+
+    assert.ok(result !== null);
+    const labels = result.items.map((i) => i.label);
+    assert.ok(labels.includes("#Campaign.reservation_date"));
+    assert.ok(labels.includes("#Campaign.reservation_expiration_date"));
+  });
+
+  void it("shows exact prefix member before fuzzy member", async () => {
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    // "reserva" prefix-matches "reservation_date" and "reservation_expiration_date"
+    const result = await provider.getSuggestions(["#Campaign.reserva"], 0, 17, { signal: signal() });
+
+    assert.ok(result !== null);
+    const labels = result.items.map((i) => i.label);
+    // Both should appear
+    assert.ok(labels.includes("#Campaign.reservation_date"));
+    assert.ok(labels.includes("#Campaign.reservation_expiration_date"));
+  });
+
+  void it("delegates to current when dotted query has no parent matches", async () => {
+    const current = mockCurrentProvider({
+      defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
+    });
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    const result = await provider.getSuggestions(["#Foo.nonexistent"], 0, 16, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(current.calls.length, 1, "should delegate to current provider");
+    assert.equal(result.items[0].value, "fallback");
+  });
+
+  void it("delegates to current when dotted query has no member matches", async () => {
+    const current = mockCurrentProvider({
+      defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
+    });
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    // parentName matches "Campaign" but no member matches "zzzzz"
+    const result = await provider.getSuggestions(["#Campaign.zzzzz"], 0, 15, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(current.calls.length, 1, "should delegate to current provider");
+    assert.equal(result.items[0].value, "fallback");
+  });
+
+  void it("preserves non-dotted query behavior", async () => {
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    // Non-dotted query "Campaign" should match the Campaign class by name
+    const result = await provider.getSuggestions(["#Campaign"], 0, 9, { signal: signal() });
+
+    assert.ok(result !== null);
+    const labels = result.items.map((i) => i.label);
+    assert.ok(labels.includes("#Campaign"), "should show Campaign class");
+    assert.equal(current.calls.length, 0, "should not delegate");
+  });
+
+  void it("supports empty member query (trailing dot)", async () => {
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => DOTTED_SYMBOLS);
+
+    const result = await provider.getSuggestions(["#Campaign."], 0, 10, { signal: signal() });
+
+    assert.ok(result !== null);
+    const labels = result.items.map((i) => i.label);
+    // All Campaign members should show
+    assert.ok(labels.includes("#Campaign.reservation_date"));
+    assert.ok(labels.includes("#Campaign.reservation_expiration_date"));
+    assert.equal(current.calls.length, 0, "should not delegate");
+  });
+
+  void it("exact parent match ranks before parent-prefix match", async () => {
+    const symbols: ProjectSymbol[] = [
+      // Exact parent match
+      { name: "reservation_date", kind: "variable", parentName: "Campaign", path: "dsp/models.py", line: 208 },
+      { name: "reservation_expiration_date", kind: "variable", parentName: "Campaign", path: "dsp/models.py", line: 207 },
+      // Parent-prefix matches (start with "Campaign" but are not exact)
+      { name: "cancel_reservation", kind: "method", parentName: "CampaignViewSet", path: "dsp/views.py", line: 42 },
+      { name: "status", kind: "property", parentName: "CampaignReservationUseCase", path: "dsp/usecases.py", line: 15 },
+    ];
+
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => symbols);
+
+    const result = await provider.getSuggestions(["#Campaign.reserva"], 0, 17, { signal: signal() });
+
+    assert.ok(result !== null);
+    const labels = result.items.map((i) => i.label);
+
+    // Exact Campaign members should come first
+    assert.equal(labels[0], "#Campaign.reservation_date");
+    assert.equal(labels[1], "#Campaign.reservation_expiration_date");
+
+    // Parent-prefix matches with prefix/fuzzy member match should follow
+    assert.equal(labels[2], "#CampaignViewSet.cancel_reservation");
+
+    // CampaignReservationUseCase.status member "status" does NOT fuzzy-match "reserva", so it's not in results
+    assert.equal(labels.length, 3, "should have exactly 3 matches: 2 exact + 1 prefix parent fuzzy");
+
+    assert.equal(current.calls.length, 0, "should not delegate to current provider");
+  });
+
+  void it("includes path:line in description for duplicate dotted names", async () => {
+    const dupeSymbols: ProjectSymbol[] = [
+      { name: "value", kind: "property", parentName: "Foo", path: "src/a.ts", line: 10 },
+      { name: "value", kind: "property", parentName: "Foo", path: "src/b.ts", line: 20 },
+    ];
+
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => dupeSymbols);
+
+    const result = await provider.getSuggestions(["#Foo.value"], 0, 10, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(result.items.length, 2);
+    // Both should show path:line due to ambiguity
+    for (const item of result.items) {
+      assert.ok(
+        item.description?.includes(":") && item.description?.includes(".ts"),
+        `description should include path:line: "${item.description}"`,
+      );
+    }
+  });
+});
+
+// ── 6. Insertion (stable token) ─────────────────────────────────────
 
 void describe("insertion", () => {
   void it("inserts stable token format #name@path:line on selection", () => {

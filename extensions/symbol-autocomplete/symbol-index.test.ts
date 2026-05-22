@@ -134,6 +134,249 @@ void describe("tags file parser", () => {
     }
   });
 
+  // ── Python class-scoped variable/constant in classic tags (bugcamp01) ──
+
+  void it("includes class-scoped variable from classic tags with kind v and class:Campaign scope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-class-var-ct-"));
+    try {
+      // Real Adtrac shape: kind=v, class:Campaign, language:Python
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        [
+          "reservation_date",
+          "dsp/models.py",
+          "/^    reservation_date = models.DateTimeField(null=True, blank=True, default=None)$/;\"",
+          "v",
+          "line:208",
+          "language:Python",
+          "class:Campaign",
+          "access:public",
+        ].join("\t"),
+        [
+          "Campaign",
+          "dsp/models.py",
+          "/^class Campaign(models.Model):$/;\"",
+          "c",
+          "line:100",
+          "language:Python",
+        ].join("\t"),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      assert.equal(index.getStatus().engine, "tags-file");
+
+      const field = index.getSymbols().find((s) => s.name === "reservation_date");
+      assert.ok(field !== undefined, "reservation_date should be indexed");
+      assert.equal(field!.kind, "variable");
+      assert.equal(field!.parentName, "Campaign");
+      assert.equal(field!.depth, 1);
+      assert.equal(field!.path, "dsp/models.py");
+      assert.equal(field!.line, 208);
+
+      // Campaign class itself should still be indexed
+      assert.ok(index.getSymbols().find((s) => s.name === "Campaign") !== undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("still excludes function-scoped variable from classic tags", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-func-var-ct-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("localVar", "src/test.ts", "v", 5, ["function:foo"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      const symbols = index.getSymbols();
+      assert.equal(symbols.length, 0, "function-scoped variable should still be excluded");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("includes interface-scoped variable from classic tags with kind v and interface:MyInterface scope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-var-ct-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("x", "src/test.ts", "v", 10, ["interface:MyInterface"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      const symbols = index.getSymbols();
+      assert.equal(symbols.length, 1, "interface-scoped variable should be included");
+      assert.equal(symbols[0].name, "x");
+      assert.equal(symbols[0].parentName, "MyInterface");
+      assert.equal(symbols[0].depth, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("includes struct-scoped variable from classic tags with kind v and struct:MyStruct scope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-struct-var-ct-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("field", "src/test.rs", "v", 5, ["struct:MyStruct"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      const symbols = index.getSymbols();
+      assert.equal(symbols.length, 1, "struct-scoped variable should be included");
+      assert.equal(symbols[0].name, "field");
+      assert.equal(symbols[0].parentName, "MyStruct");
+      assert.equal(symbols[0].depth, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("includes namespace-scoped variable from classic tags with kind v and namespace:MyNs scope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-ns-var-ct-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("CONST_VAL", "src/test.cpp", "v", 3, ["namespace:MyNs"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      const symbols = index.getSymbols();
+      assert.equal(symbols.length, 1, "namespace-scoped variable should be included");
+      assert.equal(symbols[0].name, "CONST_VAL");
+      assert.equal(symbols[0].parentName, "MyNs");
+      assert.equal(symbols[0].depth, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("includes module-scoped variable from classic tags with kind v and module:MyMod scope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-mod-var-ct-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("glob", "src/test.ex", "v", 7, ["module:MyMod"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      const symbols = index.getSymbols();
+      assert.equal(symbols.length, 1, "module-scoped variable should be included");
+      assert.equal(symbols[0].name, "glob");
+      assert.equal(symbols[0].parentName, "MyMod");
+      assert.equal(symbols[0].depth, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+
+
+  void it("extracts parentName from classic tags scope fields", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tags-pname-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("_type", "src/types.ts", "p", 24, ["interface:CtagsTag"]),
+        classicTagLine("MyClass", "src/types.ts", "c", 1),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      assert.equal(index.getStatus().engine, "tags-file");
+
+      const typeProp = index.getSymbols().find((s) => s.name === "_type");
+      assert.ok(typeProp !== undefined);
+      assert.equal(typeProp!.kind, "property");
+      assert.equal(typeProp!.parentName, "CtagsTag");
+      assert.equal(typeProp!.depth, 1);
+
+      const myClass = index.getSymbols().find((s) => s.name === "MyClass");
+      assert.ok(myClass !== undefined);
+      assert.equal(myClass!.parentName, undefined);
+      assert.equal(myClass!.depth, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("extracts last scope segment from classic tags scope:kind:name format", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tags-scope-kind-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("reservation_date", "src/models/campaign.ts", "p", 42, ["scope:class:Campaign"]),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      assert.equal(index.getStatus().engine, "tags-file");
+
+      const sym = index.getSymbols().find((s) => s.name === "reservation_date");
+      assert.ok(sym !== undefined);
+      assert.equal(sym!.kind, "property");
+      // scope:class:Campaign should extract last segment "Campaign", not "class:Campaign"
+      assert.equal(sym!.parentName, "Campaign");
+      assert.equal(sym!.depth, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("does not set parentName for unscoped classic tags symbols", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-noscope-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+        classicTagLine("CONFIG", "src/config.ts", "C", 1),
+      ]));
+
+      const index = createSymbolIndexManager({
+        cwd: tmpDir,
+        executor: async () => ({ code: 127, stdout: "", stderr: "should not run" }),
+      });
+      await index.refresh();
+
+      assert.equal(index.getStatus().engine, "tags-file");
+      const sym = index.getSymbols()[0];
+      assert.equal(sym.parentName, undefined);
+      assert.equal(sym.depth, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   void it("falls back to ctags when no tags file exists", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-no-tags-"));
     try {
@@ -222,7 +465,122 @@ void describe("ctags parser", () => {
     assert.equal(symbols.length, 2);
   });
 
-  // ── Variable/constant scope filtering (regression) ────────────────
+  // ── Variable/constant scope filtering (regression + bugcamp01) ─────
+
+  void it("includes class-scoped variable with Universal Ctags scope and scopeKind", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "reservation_date", path: "dsp/models.py", pattern: "/^    reservation_date = ...$/", line: 208, kind: "variable", scope: "Campaign", scopeKind: "class", access: "public", language: "Python" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "reservation_date");
+    assert.equal(symbols[0].kind, "variable");
+    assert.equal(symbols[0].parentName, "Campaign");
+    assert.equal(symbols[0].depth, 1);
+  });
+
+  void it("includes class-scoped variable with legacy scope class:Campaign", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "reservation_date", path: "dsp/models.py", pattern: "/^    reservation_date = ...$/", line: 208, kind: "variable", scope: "class:Campaign", scopeKind: "class", access: "public", language: "Python" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "reservation_date");
+    assert.equal(symbols[0].kind, "variable");
+    assert.equal(symbols[0].parentName, "Campaign");
+    assert.equal(symbols[0].depth, 1);
+  });
+
+  void it("includes class-scoped constant with scope class:MyClass", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "MY_CONST", path: "src/test.ts", line: 5, kind: "constant", scope: "class:MyClass", scopeKind: "class" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "MY_CONST");
+    assert.equal(symbols[0].parentName, "MyClass");
+  });
+
+  void it("includes class-scoped variable with scopeKind: class (no scope field)", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "ivar", path: "src/test.ts", line: 3, kind: "variable", scopeKind: "class" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "ivar");
+  });
+
+  void it("includes struct-scoped variable with scope struct:MyStruct", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "x", path: "src/test.rs", line: 1, kind: "variable", scope: "struct:MyStruct", scopeKind: "struct" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "x");
+    assert.equal(symbols[0].parentName, "MyStruct");
+  });
+
+  void it("includes interface-scoped variable with scope interface:MyInterface", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "ifaceConst", path: "src/test.ts", line: 5, kind: "constant", scope: "interface:MyInterface", scopeKind: "interface" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "ifaceConst");
+    assert.equal(symbols[0].parentName, "MyInterface");
+  });
+
+  void it("includes namespace-scoped variable with scope namespace:MyNs", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "nsVal", path: "src/test.cpp", line: 1, kind: "variable", scope: "namespace:MyNs", scopeKind: "namespace" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "nsVal");
+    assert.equal(symbols[0].parentName, "MyNs");
+  });
+
+  void it("includes module-scoped variable with scope module:MyMod", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "modConst", path: "src/test.ex", line: 1, kind: "constant", scope: "module:MyMod", scopeKind: "module" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "modConst");
+    assert.equal(symbols[0].parentName, "MyMod");
+  });
 
   void it("excludes variable with scope (local/parameter variable)", async () => {
     const { executor } = mockExecutor(mockCtagsSuccess([
@@ -366,6 +724,76 @@ void describe("ctags parser", () => {
     assert.ok(symbols.find((s) => s.name === "MyClass") !== undefined);
     assert.equal(symbols.find((s) => s.name === "localVar"), undefined);
     assert.equal(symbols.find((s) => s.name === "localConst"), undefined);
+  });
+
+  void it("extracts parentName from JSON ctags scope field", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "reservation_date", path: "src/models/campaign.ts", pattern: "/^  reservation_date: Date$/", line: 42, kind: "property", scope: "class:Campaign" }),
+      JSON.stringify({ _type: "tag", name: "Campaign", path: "src/models/campaign.ts", pattern: "/^class Campaign {}$/", line: 1, kind: "class" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 2);
+
+    const prop = symbols.find((s) => s.name === "reservation_date");
+    assert.ok(prop !== undefined);
+    assert.equal(prop!.kind, "property");
+    assert.equal(prop!.parentName, "Campaign");
+    assert.equal(prop!.depth, 1);
+
+    const cls = symbols.find((s) => s.name === "Campaign");
+    assert.ok(cls !== undefined);
+    assert.equal(cls!.parentName, undefined);
+    assert.equal(cls!.depth, 0);
+  });
+
+  void it("includes property, field, and member as definition kinds", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "prop", path: "src/a.ts", line: 1, kind: "property", scope: "class:A" }),
+      JSON.stringify({ _type: "tag", name: "field", path: "src/a.ts", line: 2, kind: "field", scope: "struct:A" }),
+      JSON.stringify({ _type: "tag", name: "member", path: "src/a.ts", line: 3, kind: "member", scope: "class:A" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 3);
+    assert.ok(symbols.find((s) => s.name === "prop") !== undefined);
+    assert.ok(symbols.find((s) => s.name === "field") !== undefined);
+    assert.ok(symbols.find((s) => s.name === "member") !== undefined);
+  });
+
+  void it("extracts parentName from nested scope (last segment only)", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "innerMethod", path: "src/a.ts", line: 5, kind: "method", scope: "class:Outer:Inner" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    // For nested scope "class:Outer:Inner", we take the last segment "Inner"
+    assert.equal(symbols[0].parentName, "Inner");
+    assert.equal(symbols[0].depth, 1);
+  });
+
+  void it("does not set parentName for symbols without scope", async () => {
+    const { executor } = mockExecutor(mockCtagsSuccess([
+      JSON.stringify({ _type: "tag", name: "topLevel", path: "src/a.ts", line: 1, kind: "function" }),
+    ]));
+
+    const index = createSymbolIndexManager({ cwd: "/project", executor });
+    await index.refresh();
+
+    const symbols = index.getSymbols();
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].parentName, undefined);
+    assert.equal(symbols[0].depth, 0);
   });
 });
 

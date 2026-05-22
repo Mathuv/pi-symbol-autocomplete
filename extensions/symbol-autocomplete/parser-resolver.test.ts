@@ -254,6 +254,90 @@ void describe("parser", () => {
     assert.equal(result.references.length, 1);
     assert.equal(result.references[0].name, "my_var");
   });
+
+  // ── Dotted token parsing ─────────────────────────────────────────
+
+  void it("parses dotted plain token #Parent.member", () => {
+    const result = parsePrompt("#Campaign.reservation_date");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].raw, "#Campaign.reservation_date");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[0].type, "plain");
+    assert.equal(result.references[0].path, undefined);
+    assert.equal(result.references[0].line, undefined);
+  });
+
+  void it("parses dotted stable token #Parent.member@path:line", () => {
+    const result = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].raw, "#Campaign.reservation_date@src/models/campaign.ts:42");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[0].path, "src/models/campaign.ts");
+    assert.equal(result.references[0].line, 42);
+    assert.equal(result.references[0].type, "stable");
+  });
+
+  void it("parses dotted plain token despite trailing period", () => {
+    const result = parsePrompt("Explain #Campaign.reservation_date.");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].raw, "#Campaign.reservation_date");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[0].type, "plain");
+  });
+
+  void it("parses dotted plain token with trailing comma", () => {
+    const result = parsePrompt("use #Campaign.reservation_date, #Database");
+    assert.equal(result.references.length, 2);
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[0].type, "plain");
+    assert.equal(result.references[1].name, "Database");
+  });
+
+  void it("does NOT include trailing period in dotted stable token", () => {
+    const result = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42.");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].raw, "#Campaign.reservation_date@src/models/campaign.ts:42");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+  });
+
+  void it("parses non-dotted tokens alongside dotted tokens", () => {
+    const result = parsePrompt("Check #Campaign.reservation_date and #Database");
+    assert.equal(result.references.length, 2);
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[1].name, "Database");
+  });
+
+  void it("parses dotted stable token alongside non-dotted plain", () => {
+    const result = parsePrompt("use #Campaign.reservation_date@src/models/campaign.ts:42 and #Database");
+    assert.equal(result.references.length, 2);
+    assert.equal(result.references[0].type, "stable");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[1].type, "plain");
+    assert.equal(result.references[1].name, "Database");
+  });
+
+  void it("parses dotted name with multiple dots", () => {
+    const result = parsePrompt("#A.B.C");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].name, "A.B.C");
+    assert.equal(result.references[0].type, "plain");
+  });
+
+  void it("does NOT include trailing dot when no member follows it", () => {
+    // The grammar requires Identifier after each dot, so #Foo. should not match the trailing dot
+    const result = parsePrompt("#Foo.");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].name, "Foo");
+  });
+
+  void it("parses dotted stable token after whitespace", () => {
+    const result = parsePrompt("see #Campaign.reservation_date@src/models/campaign.ts:42");
+    assert.equal(result.references.length, 1);
+    assert.equal(result.references[0].type, "stable");
+    assert.equal(result.references[0].name, "Campaign.reservation_date");
+    assert.equal(result.references[0].path, "src/models/campaign.ts");
+    assert.equal(result.references[0].line, 42);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -485,5 +569,342 @@ void describe("resolver", () => {
     assert.equal(result.injectable.length, 2); // config + exact MyService
     const injectableNames = result.injectable.map((r) => r.parsed.name).sort();
     assert.deepEqual(injectableNames, ["MyService", "config"]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// DOTTED RESOLVER TESTS
+// ═══════════════════════════════════════════════════════════════════════
+
+void describe("dotted resolver", () => {
+  // Symbols with parentName for dotted resolution tests
+  const DOTTED_SYMBOLS: ProjectSymbol[] = [
+    ...SYMBOLS,
+    { name: "reservation_date", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 42, depth: 1 },
+    { name: "reservation_expiration_date", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 55, depth: 1 },
+    { name: "status", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 60, depth: 1 },
+    // Duplicate Campaign.status in another file (for ambiguous dotted plain test)
+    { name: "status", kind: "property", parentName: "Campaign", path: "src/models/campaign_alt.ts", line: 10, depth: 1 },
+    // Same member name under a different parent
+    { name: "status", kind: "property", parentName: "Order", path: "src/models/order.ts", line: 30, depth: 1 },
+  ];
+
+  // ── Dotted stable token resolution ────────────────────────────────
+
+  void it("resolves dotted stable token by parent+member+path+line", () => {
+    const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
+    assert.equal(r.symbol?.path, "src/models/campaign.ts");
+    assert.equal(r.symbol?.line, 42);
+  });
+
+  void it("resolves dotted stable token as stale when line differs but parent+member+path match", () => {
+    const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:999");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "stale");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
+    assert.equal(r.symbol?.path, "src/models/campaign.ts");
+    assert.equal(r.symbol?.line, 42);
+    assert.ok(r.message.includes("stale"));
+  });
+
+  void it("does NOT cross-file fallback for stale dotted stable token", () => {
+    // Same parent+member but different file should NOT resolve
+    const parsed = parsePrompt("#Campaign.reservation_date@src/other/file.ts:42");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[0].symbol, null);
+  });
+
+  void it("reports unresolved for dotted stable token with wrong parent", () => {
+    const parsed = parsePrompt("#Order.reservation_date@src/models/campaign.ts:42");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[0].symbol, null);
+  });
+
+  void it("reports unresolved for dotted stable token with wrong member", () => {
+    const parsed = parsePrompt("#Campaign.nonExistent@src/models/campaign.ts:42");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[0].symbol, null);
+  });
+
+  void it("resolves dotted stable token with non-dotted stable token on same line", () => {
+    const parsed = parsePrompt([
+      "#Campaign.reservation_date@src/models/campaign.ts:42",
+      "#Database",
+    ].join("\n"));
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 2);
+    const dotted = result.resolved.find((r) => r.parsed.name === "Campaign.reservation_date");
+    assert.equal(dotted?.status, "resolved");
+    assert.equal(dotted?.symbol?.parentName, "Campaign");
+
+    const db = result.resolved.find((r) => r.parsed.name === "Database");
+    assert.equal(db?.status, "resolved");
+  });
+
+  // ── Dotted plain token resolution ────────────────────────────────
+
+  void it("resolves unique dotted plain token by parent+member", () => {
+    const parsed = parsePrompt("#Campaign.reservation_date");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
+    assert.equal(r.symbol?.path, "src/models/campaign.ts");
+    assert.equal(r.symbol?.line, 42);
+  });
+
+  void it("reports ambiguous for dotted plain token with same parent+member across files", () => {
+    // Campaign.status exists in two files, so it should be ambiguous
+    const parsed = parsePrompt("#Campaign.status");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "ambiguous");
+    assert.equal(r.symbol, null);
+    assert.ok(r.message.includes("ambiguous") || r.message.includes("multiple"));
+  });
+
+  void it("resolves dotted plain token when same member name exists under different parent", () => {
+    // Campaign.reservation_date is unique even though Order.status exists
+    const parsed = parsePrompt("#Order.status");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "status");
+    assert.equal(r.symbol?.parentName, "Order");
+  });
+
+  void it("reports unresolved for dotted plain token with no matching parent+member", () => {
+    const parsed = parsePrompt("#Campaign.nonExistent");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[0].symbol, null);
+  });
+
+  void it("reports unresolved for dotted plain token with no matching parent", () => {
+    const parsed = parsePrompt("#NonExistent.status");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[0].symbol, null);
+  });
+
+  void it("resolves non-dotted tokens alongside dotted plain tokens", () => {
+    const parsed = parsePrompt("#Database and #Campaign.reservation_date");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 2);
+
+    const dbRef = result.resolved.find((r) => r.parsed.name === "Database");
+    assert.equal(dbRef?.status, "resolved");
+
+    const dottedRef = result.resolved.find((r) => r.parsed.name === "Campaign.reservation_date");
+    assert.equal(dottedRef?.status, "resolved");
+    assert.equal(dottedRef?.symbol?.parentName, "Campaign");
+    assert.equal(dottedRef?.symbol?.name, "reservation_date");
+  });
+
+  void it("includes dotted resolved plain ref in injectable list", () => {
+    const parsed = parsePrompt("#Database\n#Campaign.reservation_date\n#Campaign.nonExistent");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 3);
+
+    // injectable should include resolved non-dotted + resolved dotted
+    assert.ok(result.injectable.some(
+      (r) => r.parsed.name === "Database" && r.status === "resolved",
+    ), "Database should be injectable");
+    assert.ok(result.injectable.some(
+      (r) => r.parsed.name === "Campaign.reservation_date" && r.status === "resolved",
+    ), "Campaign.reservation_date should be injectable");
+
+    // Unresolved should not be injectable
+    assert.ok(!result.injectable.some(
+      (r) => r.parsed.name === "Campaign.nonExistent",
+    ), "unresolved should not be injectable");
+  });
+
+  void it("includes dotted stale stable ref in injectable list", () => {
+    const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:999\n#Database");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 2);
+
+    const staleRef = result.resolved.find(
+      (r) => r.parsed.name === "Campaign.reservation_date" && r.parsed.type === "stable",
+    );
+    assert.ok(staleRef, "dotted stable token should have a resolution outcome");
+    assert.equal(staleRef?.status, "stale");
+    assert.ok(staleRef?.symbol !== null, "stale fallback should have a symbol");
+
+    // Injectable should include both resolved and stale
+    assert.equal(result.injectable.length, 2);
+    const injectableNames = result.injectable.map((r) => r.parsed.name).sort();
+    assert.deepEqual(injectableNames, ["Campaign.reservation_date", "Database"]);
+  });
+
+  void it("does not include ambiguous dotted plain ref in injectable list", () => {
+    const parsed = parsePrompt("#Campaign.status");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    assert.equal(result.resolved[0].status, "ambiguous");
+    assert.equal(result.injectable.length, 0);
+  });
+
+  // ── Multi-dot regression tests ─────────────────────────────────
+
+  void it("reports unresolved for multi-dot plain token #A.B.C", () => {
+    const parsed = parsePrompt("#A.B.C");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "unresolved");
+    assert.equal(r.symbol, null);
+    // Must NOT split as parent=A, member=B.C
+    assert.ok(r.message.includes("Unresolved") || r.message.includes("not found") || r.message.includes("no symbol"));
+  });
+
+  void it("reports unresolved for multi-dot stable token #A.B.C@path:line", () => {
+    const parsed = parsePrompt("#A.B.C@src/foo.ts:1");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "unresolved");
+    assert.equal(r.symbol, null);
+    // Must NOT split as parent=A, member=B.C
+    assert.ok(r.message.includes("multi-dot"));
+  });
+
+  void it("reports unresolved for four-segment dotted plain token", () => {
+    const parsed = parsePrompt("#Namespace.Campaign.reservation_date");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "unresolved");
+    assert.equal(r.symbol, null);
+  });
+
+  void it("still resolves valid two-segment dotted plain token", () => {
+    // Regression: ensure #Parent.member still works after multi-dot fix
+    const parsed = parsePrompt("#Campaign.reservation_date");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
+  });
+
+  void it("still resolves valid two-segment dotted stable token", () => {
+    // Regression: ensure #Parent.member@path:line still works after multi-dot fix
+    const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42");
+    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
+    assert.equal(r.symbol?.path, "src/models/campaign.ts");
+    assert.equal(r.symbol?.line, 42);
+  });
+
+  // ── Multi-dot regression tests: literal dotted symbol ───────────
+
+  void it("reports unresolved for multi-dot plain #A.B.C even when literal A.B.C exists", () => {
+    // Regression: a literal symbol named "A.B.C" must NOT be resolved
+    // via #A.B.C because multi-dot refs are unsupported chains in v1.
+    const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
+      ...DOTTED_SYMBOLS,
+      { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
+    ];
+    const parsed = parsePrompt("#A.B.C");
+    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "unresolved");
+    assert.equal(r.symbol, null);
+    assert.ok(r.message.includes("multi-dot"));
+  });
+
+  void it("reports unresolved for multi-dot stable #A.B.C@x.ts:1 even when literal A.B.C exists", () => {
+    const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
+      ...DOTTED_SYMBOLS,
+      { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
+    ];
+    const parsed = parsePrompt("#A.B.C@x.ts:1");
+    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "unresolved");
+    assert.equal(r.symbol, null);
+    assert.ok(r.message.includes("multi-dot"));
+  });
+
+  void it("still resolves normal non-dotted refs when literal dotted symbol exists", () => {
+    // Ensure non-dotted refs are not affected by the presence of dotted-name symbols
+    const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
+      ...DOTTED_SYMBOLS,
+      { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
+    ];
+    const parsed = parsePrompt("#Database");
+    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "Database");
+  });
+
+  void it("still resolves valid two-segment dotted refs when literal dotted symbol exists", () => {
+    const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
+      ...DOTTED_SYMBOLS,
+      { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
+    ];
+    const parsed = parsePrompt("#Campaign.reservation_date");
+    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+
+    assert.equal(result.resolved.length, 1);
+    const r = result.resolved[0];
+    assert.equal(r.status, "resolved");
+    assert.equal(r.symbol?.name, "reservation_date");
+    assert.equal(r.symbol?.parentName, "Campaign");
   });
 });

@@ -91,8 +91,10 @@ function createPromptEvent(prompt: string) {
 
 // ── Ctags data helpers ─────────────────────────────────────────────
 
-function ctagsLine(name: string, path: string, line: number, kind: string): string {
-  return JSON.stringify({ _type: "tag", name, path, pattern: "/^" + kind + " " + name + "/", line, kind });
+function ctagsLine(name: string, path: string, line: number, kind: string, scope?: string): string {
+  const tag: Record<string, unknown> = { _type: "tag", name, path, pattern: "/^" + kind + " " + name + "/", line, kind };
+  if (scope) tag.scope = scope;
+  return JSON.stringify(tag);
 }
 
 function classicTagsFile(lines: string[]): string {
@@ -104,15 +106,17 @@ function classicTagsFile(lines: string[]): string {
   ].join("\n") + "\n";
 }
 
-function classicTagLine(name: string, filePath: string, kind: string, line: number): string {
-  return [
+function classicTagLine(name: string, filePath: string, kind: string, line: number, scope?: string): string {
+  const parts = [
     name,
     filePath,
     `/^${kind} ${name}/;\"`,
     kind,
     `line:${line}`,
     "language:TypeScript",
-  ].join("\t");
+  ];
+  if (scope) parts.push(`scope:${scope}`);
+  return parts.join("\t");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -358,5 +362,171 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(ambiguousWarnings.length, 1);
     assert.equal(ambiguousWarnings[0].type, "warning");
     assert.equal(result, undefined);
+  });
+
+  void it("suggests scoped members via dotted autocomplete from tags file", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-ac-"));
+    fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
+      "class Campaign {",
+      "  reservation_date: string;",
+      "  reservation_expiration_date: string;",
+      "  constructor() { this.reservation_date = ''; }",
+      "}",
+    ].join("\n"), "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("Campaign", "campaign.ts", "class", 1),
+      classicTagLine("reservation_date", "campaign.ts", "property", 2, "class:Campaign"),
+      classicTagLine("reservation_expiration_date", "campaign.ts", "property", 3, "class:Campaign"),
+    ]), "utf-8");
+
+    try {
+      let commandCalls = 0;
+      const executor = async () => {
+        commandCalls++;
+        return { code: 127, stdout: "", stderr: "should not run" };
+      };
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      let providerFactory: ((current: any) => any) | undefined;
+      const ctx = createContext(tmpDir, notifyCalls, executor);
+      ctx.ui.addAutocompleteProvider = (factory: (current: any) => any) => {
+        providerFactory = factory;
+      };
+
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      assert.equal(commandCalls, 0, "pre-built tags file should avoid ctags execution");
+      assert.ok(providerFactory, "should register autocomplete provider");
+
+      const currentProvider = {
+        async getSuggestions() { return null; },
+        applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: any, prefix: string) {
+          const line = lines[cursorLine] ?? "";
+          const start = cursorCol - prefix.length;
+          const nextLines = [...lines];
+          nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
+          return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+        },
+      };
+      const provider = providerFactory(currentProvider);
+      const suggestions = await provider.getSuggestions(["#Campaign.reservatio"], 0, 20, { signal: AbortSignal.timeout(1000) });
+
+      assert.ok(suggestions);
+      assert.equal(suggestions.prefix, "#Campaign.reservatio");
+      assert.equal(suggestions.items[0].label, "#Campaign.reservation_date");
+      assert.equal(suggestions.items[0].value, "#Campaign.reservation_date@campaign.ts:2");
+      assert.equal(suggestions.items[0].description, "Property \u00b7 campaign.ts");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("injects dotted stable token symbol-context for scoped member (end-to-end)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-stable-"));
+    fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
+      "class Campaign {",
+      "  reservation_date: string;",
+      "  reservation_expiration_date: string;",
+      "  constructor() { this.reservation_date = ''; }",
+      "}",
+    ].join("\n"), "utf-8");
+
+    try {
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      const ctags = [
+        ctagsLine("Campaign", "campaign.ts", 1, "class"),
+        ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
+        ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
+      ].join("\n") + "\n";
+      const executor = async () => ({ code: 0, stdout: ctags, stderr: "" });
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+
+      const ctx = createContext(tmpDir, notifyCalls, executor);
+
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const result = await pi.handlers.get("before_agent_start")(
+        createPromptEvent("Use #Campaign.reservation_date@campaign.ts:2"),
+        ctx,
+      );
+
+      assert.ok(result !== undefined, "should return injection result");
+      assert.ok((result as any).message !== undefined, "should have message property");
+      assert.equal((result as any).message.customType, "symbol-context");
+      assert.equal((result as any).message.display, false);
+
+      const payload = JSON.parse((result as any).message.content);
+      assert.ok(Array.isArray(payload));
+      assert.equal(payload.length, 1);
+      assert.equal(payload[0].metadata.name, "reservation_date");
+      assert.equal(payload[0].metadata.kind, "property");
+      assert.equal(payload[0].metadata.path, "campaign.ts");
+      assert.equal(payload[0].metadata.line, 2);
+      assert.ok(payload[0].definition.includes("reservation_date"));
+      assert.ok(payload[0].definition.includes("string"));
+
+      // No warnings for happy path
+      assert.equal(notifyCalls.filter((c) => c.type === "warning").length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("injects symbol-context for typed plain dotted reference when unique (end-to-end)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-plain-"));
+    fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
+      "class Campaign {",
+      "  reservation_date: string;",
+      "  reservation_expiration_date: string;",
+      "  constructor() { this.reservation_date = ''; }",
+      "}",
+    ].join("\n"), "utf-8");
+
+    try {
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      const ctags = [
+        ctagsLine("Campaign", "campaign.ts", 1, "class"),
+        ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
+        ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
+      ].join("\n") + "\n";
+      const executor = async () => ({ code: 0, stdout: ctags, stderr: "" });
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+
+      const ctx = createContext(tmpDir, notifyCalls, executor);
+
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const result = await pi.handlers.get("before_agent_start")(
+        createPromptEvent("Use #Campaign.reservation_date"),
+        ctx,
+      );
+
+      assert.ok(result !== undefined, "should return injection result");
+      assert.ok((result as any).message !== undefined, "should have message property");
+      assert.equal((result as any).message.customType, "symbol-context");
+      assert.equal((result as any).message.display, false);
+
+      const payload = JSON.parse((result as any).message.content);
+      assert.ok(Array.isArray(payload));
+      assert.equal(payload.length, 1);
+      assert.equal(payload[0].metadata.name, "reservation_date");
+      assert.equal(payload[0].metadata.kind, "property");
+      assert.equal(payload[0].metadata.path, "campaign.ts");
+      assert.equal(payload[0].metadata.line, 2);
+      assert.ok(payload[0].definition.includes("reservation_date"));
+      assert.ok(payload[0].definition.includes("string"));
+
+      // No warnings for happy path
+      assert.equal(notifyCalls.filter((c) => c.type === "warning").length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -12,6 +12,8 @@ export interface ProjectSymbol {
   endLine?: number;
   /** Scope depth within the file. 0 = file-level. */
   depth?: number;
+  /** Parent symbol name for scoped members (e.g. class name for a property). */
+  parentName?: string;
 }
 
 /** The indexing engine used to build the symbol catalog. */
@@ -113,6 +115,9 @@ export const DEFINITION_KINDS = new Set([
   "event",
   "trait",
   "impl",
+  "property",
+  "field",
+  "member",
 ]);
 
 // ── Parser / Resolver types ─────────────────────────────────────────
