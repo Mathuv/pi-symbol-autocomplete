@@ -286,6 +286,31 @@ void describe("disambiguation", () => {
     // The two should have different descriptions (different paths/lines)
     assert.notEqual(itemsForMyService[0].description, itemsForMyService[1].description);
   });
+
+  void it("shows full non-dotted labels instead of description-clipped labels", async () => {
+    const symbols: ProjectSymbol[] = [
+      {
+        name: "SalesChannelContractContactMilestone",
+        kind: "class",
+        path: "marketplace/views/contract_management.py",
+        line: 153,
+      },
+    ];
+
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => symbols);
+    const line = "#SalesChannelCon";
+
+    const result = await provider.getSuggestions([line], 0, line.length, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(result.items[0].label, "#SalesChannelContractContactMilestone");
+    assert.equal(
+      result.items[0].value,
+      "#SalesChannelContractContactMilestone@marketplace/views/contract_management.py:153",
+    );
+    assert.equal(result.items[0].description, undefined);
+  });
 });
 
 // ── 5. Dotted queries ────────────────────────────────────────────
@@ -418,13 +443,14 @@ void describe("dotted queries", () => {
 
     assert.ok(result !== null);
     const labels = result.items.map((i) => i.label);
+    const values = result.items.map((i) => i.value);
 
     // Exact Campaign members should come first
     assert.equal(labels[0], "#Campaign.reservation_date");
     assert.equal(labels[1], "#Campaign.reservation_expiration_date");
 
     // Parent-prefix matches with prefix/fuzzy member match should follow
-    assert.equal(labels[2], "#CampaignViewSet.cancel_reservation");
+    assert.equal(values[2], "#CampaignViewSet.cancel_reservation@dsp/views.py:42");
 
     // CampaignReservationUseCase.status member "status" does NOT fuzzy-match "reserva", so it's not in results
     assert.equal(labels.length, 3, "should have exactly 3 matches: 2 exact + 1 prefix parent fuzzy");
@@ -452,6 +478,61 @@ void describe("dotted queries", () => {
         `description should include path:line: "${item.description}"`,
       );
     }
+  });
+
+  void it("shows full dotted labels up to a generous max length", async () => {
+    const symbols: ProjectSymbol[] = [
+      {
+        name: "semantic_settings_cache_key",
+        kind: "variable",
+        parentName: "CmsConnectionInfo",
+        path: "ssp/models.py",
+        line: 437,
+      },
+    ];
+
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => symbols);
+    const line = "#CmsConnectionInfo.sema";
+
+    const result = await provider.getSuggestions([line], 0, line.length, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(
+      result.items[0].value,
+      "#CmsConnectionInfo.semantic_settings_cache_key@ssp/models.py:437",
+    );
+    assert.equal(result.items[0].label, "#CmsConnectionInfo.semantic_settings_cache_key");
+    assert.equal(result.items[0].description, undefined);
+  });
+
+  void it("compacts extreme dotted labels without changing the inserted token", async () => {
+    const symbols: ProjectSymbol[] = [
+      {
+        name: "memberNameThatIsFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu",
+        kind: "variable",
+        parentName: "ParentNameThatIsAlsoFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu",
+        path: "ssp/models.py",
+        line: 437,
+      },
+    ];
+
+    const current = mockCurrentProvider();
+    const provider = createSymbolAutocompleteProvider(current, () => symbols);
+    const line = "#ParentNameThatIsAlsoFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu.member";
+
+    const result = await provider.getSuggestions([line], 0, line.length, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.equal(
+      result.items[0].value,
+      "#ParentNameThatIsAlsoFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu.memberNameThatIsFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu@ssp/models.py:437",
+    );
+    assert.notEqual(result.items[0].label, result.items[0].value.split("@")[0]);
+    assert.ok(result.items[0].label.length <= 96);
+    assert.ok(result.items[0].label.startsWith("#Parent"));
+    assert.ok(result.items[0].label.endsWith("AutocompleteMenu"));
+    assert.equal(result.items[0].description, undefined);
   });
 });
 

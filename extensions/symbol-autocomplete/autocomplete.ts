@@ -12,6 +12,9 @@
 
 import type { ProjectSymbol } from "./types.ts";
 
+const MAX_LABEL_LENGTH = 96;
+const MAX_DESCRIBED_LABEL_LENGTH = 32;
+
 // ── Types matching @earendil-works/pi-tui interfaces ────────────────
 // Defined locally to avoid pi-tui import dependency in tests.
 
@@ -115,6 +118,17 @@ function stableToken(sym: ProjectSymbol, includeParent?: boolean): string {
     ? `${sym.parentName}.${sym.name}`
     : sym.name;
   return `#${name}@${sym.path}:${sym.line}`;
+}
+
+function compactLabel(displayName: string): string {
+  const label = `#${displayName}`;
+  if (label.length <= MAX_LABEL_LENGTH) {
+    return label;
+  }
+
+  const tailLength = Math.floor((MAX_LABEL_LENGTH - 1) / 2);
+  const headLength = MAX_LABEL_LENGTH - 1 - tailLength;
+  return `${label.slice(0, headLength)}…${label.slice(-tailLength)}`;
 }
 
 /**
@@ -310,9 +324,15 @@ function formatSymbolItem(
   const location =
     sameNameCount > 1 ? `${sym.path}:${sym.line}` : sym.path;
 
+  const label = compactLabel(displayName);
+
+  const description = label.length > MAX_DESCRIBED_LABEL_LENGTH
+    ? undefined
+    : `${kind} · ${location}`;
+
   return {
     value: token,
-    label: `#${displayName}`,
-    description: `${kind} · ${location}`,
+    label,
+    description,
   };
 }
