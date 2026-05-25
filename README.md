@@ -22,6 +22,17 @@ Then run `/reload` in Pi.
 
 Type `#` at the start of a prompt token or after whitespace, then start typing a symbol name. The extension fuzzy-matches definition-level symbols from the current repository, including classes, functions, methods, interfaces, types, enums, and module-level variables/constants.
 
+Dotted member references let you autocomplete members scoped under a parent symbol. Type
+`#Campaign.reservatio` to find members indexed under `Campaign`:
+
+```text
+#Campaign.reservation_date@src/models/campaign.ts:42
+```
+
+Dotted references use lexical ctags scope (`Parent.member`). v1 does not perform runtime
+type inference or resolve arbitrary multi-hop chains like `Namespace.Campaign.member`.
+Ast-grep fallback symbols have no parent scope and are not available as dotted references.
+
 Selecting a suggestion inserts a stable token:
 
 ```text
@@ -39,7 +50,9 @@ On submit, Pi injects a hidden `symbol-context` message containing the resolved 
 ## Reference modes
 
 - **Selected stable token** — `#<name>@<repo-relative-path>:<line>` resolves by exact name/path/line. If the line is stale, it falls back to same-name in the same file and warns once in the UI. It never falls back across files.
+- **Selected dotted stable token** — `#<parent>.<member>@<repo-relative-path>:<line>` resolves by exact parent, member, path, and line. Stale fallback stays within the same file and parent/member combination.
 - **Plain typed reference** — `#name` resolves only when exactly one indexed symbol has that name. Ambiguous or missing plain references are skipped with a UI warning.
+- **Typed plain dotted reference** — `#<parent>.<member>` resolves only when exactly one indexed symbol has that parent name and member name combination. Ambiguous or missing dotted plain references are skipped with a UI warning.
 
 References inside triple-backtick fenced code blocks are ignored.
 
@@ -63,6 +76,7 @@ Default excludes skip heavy/vendor/generated directories such as `.git`, `node_m
 - About 3000 chars per symbol payload.
 - Truncated payloads include `...[truncated]`.
 - Warnings are shown via Pi UI notifications only; warnings are not injected into the prompt.
+- v1 dotted member references are limited to lexical ctags scope (`Parent.member`). There is no runtime type inference, no arbitrary multi-hop chain resolution, and ast-grep fallback symbols have no parent scope for dotted matching.
 
 ## Commands
 
@@ -102,4 +116,3 @@ The tests use Node's built-in test runner with TypeScript type stripping.
 
 - [ ] Cap autocomplete results to a reasonable number (e.g. 100).
 - [ ] Measure memory usage for in-memory index and optimize. Consider `readtags` based search.
-- [ ] Add support for searching for `<symbol>.<attribute>` references, e.g. `#MyClass.myMethod`.

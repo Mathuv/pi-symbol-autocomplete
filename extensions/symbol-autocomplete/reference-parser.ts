@@ -59,8 +59,8 @@ function parseLine(line: string, lineIndex: number): ParsedReference[] {
     if (line[i] === "#" && (i === 0 || line[i - 1] === " " || line[i - 1] === "\t")) {
       const rest = line.slice(i);
 
-      // Try stable token: #name@path:line
-      const stableMatch = rest.match(/^#([\w][\w\d]*)@([^\s:]+?):(\d+)/);
+      // Try stable token: #name@path:line (name may include dots)
+      const stableMatch = rest.match(/^#([\w][\w\d]*(?:\.[\w][\w\d]*)*)@([^\s:]+?):(\d+)/);
       if (stableMatch) {
         refs.push({
           raw: stableMatch[0],
@@ -75,8 +75,8 @@ function parseLine(line: string, lineIndex: number): ParsedReference[] {
         continue;
       }
 
-      // Try plain token: #name
-      const plainMatch = rest.match(/^#([\w][\w\d]*)/);
+      // Try plain token: #name (name may include dots)
+      const plainMatch = rest.match(/^#([\w][\w\d]*(?:\.[\w][\w\d]*)*)/);
       if (plainMatch) {
         refs.push({
           raw: plainMatch[0],

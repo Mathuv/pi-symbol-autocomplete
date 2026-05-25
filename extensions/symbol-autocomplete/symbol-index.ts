@@ -18,6 +18,23 @@ import {
   DEFINITION_KINDS,
 } from "./types.ts";
 
+/**
+ * Ctags scope kinds that represent class/type-like member scopes.
+ * Variables/constants under these scopes are member-like, not local variables.
+ * Language-agnostic: derives from ctags scope metadata, not language names.
+ */
+const MEMBER_SCOPE_KINDS = new Set([
+  "class",
+  "struct",
+  "interface",
+  "namespace",
+  "module",
+  "union",
+  "enum",
+  "trait",
+  "impl",
+]);
+
 // ── Parser: ctags JSON output ───────────────────────────────────────
 
 interface CtagsTag {
@@ -51,18 +68,23 @@ function parseCtagsOutput(stdout: string): ProjectSymbol[] {
       // Only include definition-level kinds
       if (!DEFINITION_KINDS.has(tag.kind)) continue;
 
-      // Skip variable/constant tags with scope or scopeKind (these are local/parameter
-      // variables, not module-level definitions like globals or module constants)
-      if ((tag.kind === "variable" || tag.kind === "constant") && (tag.scope || tag.scopeKind)) {
-        continue;
+      // Scoped variables/constants: include only if within a class/type-like member scope.
+      // Base decision on scopeKind or scope prefix (not language).
+      if (tag.kind === "variable" || tag.kind === "constant") {
+        if (tag.scope || tag.scopeKind) {
+          const scopeKindValue = (tag.scopeKind || tag.scope?.split(":")[0] || "").toLowerCase();
+          if (!MEMBER_SCOPE_KINDS.has(scopeKindValue)) continue;
+        }
       }
 
-      // Determine depth from scope info
+      // Determine depth and parentName from scope info
       let depth = 0;
+      let parentName: string | undefined;
       if (tag.scope) {
-        // scope format: "class:MyClass" or "function:myFunc"
-        depth = tag.scope.split(":").length - 1;
-        if (depth > 0) depth = 1; // we just track 0=file-level vs 1+=scoped for now
+        // scope format can be "class:MyClass" or just "MyClass" with scopeKind: "class".
+        const segments = tag.scope.split(":");
+        parentName = segments[segments.length - 1];
+        depth = segments.length > 1 || tag.scopeKind ? 1 : 0;
       }
 
       symbols.push({
@@ -71,6 +93,7 @@ function parseCtagsOutput(stdout: string): ProjectSymbol[] {
         path: tag.path,
         line: tag.line,
         depth,
+        parentName,
       });
     } catch {
       // Skip malformed JSON lines
@@ -96,6 +119,7 @@ const COMMON_KIND_ALIASES = new Map<string, string>([
   ["i", "interface"],
   ["m", "method"],
   ["n", "namespace"],
+  ["p", "property"],
   ["s", "struct"],
   ["t", "typedef"],
   ["v", "variable"],
@@ -176,6 +200,11 @@ function parseClassicCtagsOutput(stdout: string): ProjectSymbol[] {
     let lineNumber: number | undefined;
     let language: string | undefined;
     let hasScope = false;
+    let parentName: string | undefined;
+    // Track whether the scope is a class/type-like member scope (e.g. "class:Campaign",
+    // "struct:MyStruct") so member-scoped variables/constants can be included while
+    // function/parameter-scoped ones are excluded.
+    let isMemberScope = false;
 
     for (const field of columns.slice(3)) {
       if (!field) continue;
@@ -198,6 +227,14 @@ function parseClassicCtagsOutput(stdout: string): ProjectSymbol[] {
         language = value;
       } else if (key === "scope" || key === "scopeKind" || isScopeField(key)) {
         hasScope = true;
+        if (MEMBER_SCOPE_KINDS.has(key)) isMemberScope = true;
+        if (key === "scope" && MEMBER_SCOPE_KINDS.has(value.split(":")[0])) isMemberScope = true;
+        if (key === "scopeKind" && MEMBER_SCOPE_KINDS.has(value.toLowerCase())) isMemberScope = true;
+        if (key !== "scopeKind" && value) {
+          // scope field value format is "kind:name" (e.g. "class:Campaign").
+          // Extract only the last segment (the actual parent name).
+          parentName = value.split(":").at(-1) ?? value;
+        }
       }
     }
 
@@ -206,7 +243,8 @@ function parseClassicCtagsOutput(stdout: string): ProjectSymbol[] {
     const kind = normalizeTagKind(rawKind, language, aliases);
     if (!DEFINITION_KINDS.has(kind)) continue;
 
-    if ((kind === "variable" || kind === "constant") && hasScope) {
+    // Exclude scoped variables/constants unless they are member-scoped (class/type-like)
+    if ((kind === "variable" || kind === "constant") && hasScope && !isMemberScope) {
       continue;
     }
 
@@ -216,6 +254,7 @@ function parseClassicCtagsOutput(stdout: string): ProjectSymbol[] {
       path: rawPath.replace(/^\.\//, ""),
       line: lineNumber,
       depth: hasScope ? 1 : 0,
+      parentName,
     });
   }
 
