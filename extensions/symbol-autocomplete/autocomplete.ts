@@ -6,9 +6,10 @@
  * renders disambiguated suggestions, and inserts stable tokens
  * (`#name@path:line`) on selection.
  *
- * A query needs at least one character after `#`. Bare `#` and bare
- * `#Parent.` delegate to the built-in provider. Backend errors and empty
- * results also delegate; this provider never throws out of getSuggestions.
+ * A query needs at least one character after `#`. Bare `#`, bare
+ * `#Parent.`, and multi-dot chains (`#A.B.C`) delegate to the built-in
+ * provider. Backend errors, empty results, and aborted queries also
+ * delegate; this provider never throws out of getSuggestions.
  */
 
 import type { ProjectSymbol, ReadtagsBackend } from "./types.ts";
@@ -87,6 +88,12 @@ export function createSymbolAutocompleteProvider(
       }
 
       const dotIndex = query.indexOf(".");
+      // The resolver rejects multi-dot chains (#A.B.C), so any stable
+      // token built from them would never resolve. Delegate instead.
+      if (dotIndex >= 0 && query.slice(dotIndex + 1).includes(".")) {
+        return current.getSuggestions(lines, cursorLine, cursorCol, options);
+      }
+
       let results: ProjectSymbol[] | null;
       try {
         results = dotIndex > 0
@@ -96,6 +103,11 @@ export function createSymbolAutocompleteProvider(
           : await backend.queryPrefix(query, MAX_SUGGESTIONS, options.signal);
       } catch {
         results = null;
+      }
+
+      // An aborted query must not surface partial backend results.
+      if (options.signal?.aborted) {
+        return current.getSuggestions(lines, cursorLine, cursorCol, options);
       }
 
       if (!results || results.length === 0) {

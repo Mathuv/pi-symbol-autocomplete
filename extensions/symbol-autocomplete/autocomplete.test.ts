@@ -249,6 +249,62 @@ void describe("delegation", () => {
     assert.equal(backend.calls.length, 1);
   });
 
+  void it("delegates when the query is aborted while the backend is pending", async () => {
+    let resolveBackend!: (syms: ProjectSymbol[]) => void;
+    const deferred = new Promise<ProjectSymbol[]>((resolve) => {
+      resolveBackend = resolve;
+    });
+    const current = mockCurrentProvider({
+      defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
+    });
+    const backend = createMockBackend({
+      prefix: async () => deferred,
+    });
+    const provider = createSymbolAutocompleteProvider(current, backend);
+
+    const controller = new AbortController();
+    const pending = provider.getSuggestions(["#My"], 0, 3, { signal: controller.signal });
+
+    controller.abort();
+    resolveBackend([SYMBOLS[0]]);
+
+    const result = await pending;
+
+    assert.ok(result !== null, "getSuggestions must not throw");
+    assert.equal(current.calls.length, 1, "should delegate to current provider");
+    assert.equal(result.items[0].value, "fallback", "should delegate instead of returning backend results");
+    assert.equal(
+      result.items.some((i) => i.value.startsWith("#MyService@")),
+      false,
+      "must not return symbols from an aborted backend result",
+    );
+  });
+
+  void it("delegates on a multi-dot query (#A.B.C) without calling the backend", async () => {
+    const current = mockCurrentProvider({
+      defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
+    });
+    const backend = createMockBackend();
+    const provider = createSymbolAutocompleteProvider(current, backend);
+
+    const result = await provider.getSuggestions(["#Campaign.User.name"], 0, 18, { signal: signal() });
+
+    assert.ok(result !== null, "should delegate to current provider");
+    assert.equal(current.calls.length, 1, "should delegate to current provider");
+    assert.equal(result.items[0].value, "fallback");
+    assert.equal(backend.calls.length, 0, "multi-dot query must not call the backend");
+    assert.equal(
+      backend.calls.some((c) => c.method === "queryPrefix"),
+      false,
+      "queryPrefix must not be called",
+    );
+    assert.equal(
+      backend.calls.some((c) => c.method === "queryDotted"),
+      false,
+      "queryDotted must not be called",
+    );
+  });
+
   void it("delegates when the dotted backend query throws", async () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
@@ -389,33 +445,59 @@ void describe("ranking", () => {
     assert.ok(depth2 < depth3, "shallower path should come first");
   });
 
-  void it("keeps exact-parent dotted items before prefix-parent items", async () => {
+  void it("orders same-depth names by name, ignoring backend order", async () => {
     const symbols: ProjectSymbol[] = [
-      // Exact parent match, deeper path
-      { name: "reservation_expiration_date", kind: "variable", parentName: "Campaign", path: "dsp/deep/models.py", line: 207 },
-      // Exact parent match, shallower path
-      { name: "reservation_date", kind: "variable", parentName: "Campaign", path: "dsp/models.py", line: 208 },
-      // Prefix parent matches
+      { name: "Beta", kind: "class", path: "src/beta.ts", line: 3 },
+      { name: "Zebra", kind: "class", path: "src/zebra.ts", line: 2 },
+      { name: "alpha", kind: "class", path: "src/alpha.ts", line: 1 },
+    ];
+    const backend = createMockBackend({
+      // Backend returns the reverse of the sorted order.
+      prefix: async () => [...symbols].reverse(),
+    });
+    const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
+
+    const result = await provider.getSuggestions(["#a"], 0, 2, { signal: signal() });
+
+    assert.ok(result !== null);
+    assert.deepEqual(
+      result.items.map((i) => i.label),
+      ["#Beta", "#Zebra", "#alpha"],
+      "same-depth names must sort by the byDepthThenName contract",
+    );
+  });
+
+  void it("keeps exact-parent dotted items before prefix-parent items, case-insensitively", async () => {
+    const symbols: ProjectSymbol[] = [
+      // Prefix-parent match, returned first by the backend.
       { name: "cancel_reservation", kind: "method", parentName: "CampaignViewSet", path: "dsp/views.py", line: 42 },
-      { name: "status", kind: "property", parentName: "CampaignReservationUseCase", path: "dsp/usecases.py", line: 15 },
+      // Exact parent match (case differs from the query), deeper path.
+      { name: "reservation_expiration_date", kind: "variable", parentName: "Campaign", path: "dsp/deep/models.py", line: 207 },
+      // Exact parent match, same depth, returned before its name order.
+      { name: "zzz_after", kind: "property", parentName: "Campaign", path: "dsp/models.py", line: 209 },
+      // Exact parent match, same depth, name sorts first.
+      { name: "reservation_date", kind: "variable", parentName: "Campaign", path: "dsp/models.py", line: 208 },
     ];
     const backend = createMockBackend({
       dotted: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
-    const result = await provider.getSuggestions(["#Campaign.reserva"], 0, 17, { signal: signal() });
+    const result = await provider.getSuggestions(["#cAmPaIgN.res"], 0, 13, { signal: signal() });
 
     assert.ok(result !== null);
     const labels = result.items.map((i) => i.label);
 
-    // Exact Campaign members come first, sorted by path depth
-    assert.equal(labels[0], "#Campaign.reservation_date");
-    assert.equal(labels[1], "#Campaign.reservation_expiration_date");
+    // Exact Campaign members come first despite the mixed-case query,
+    // sorted by path depth then name.
+    assert.deepEqual(labels.slice(0, 3), [
+      "#Campaign.reservation_date",
+      "#Campaign.zzz_after",
+      "#Campaign.reservation_expiration_date",
+    ]);
 
-    // Prefix-parent matches follow, never ahead of exact matches
-    assert.equal(labels[2], "#CampaignViewSet.cancel_reservation");
-    assert.equal(labels[3], "#CampaignReservationUseCase.status");
+    // Prefix-parent matches follow, never ahead of exact matches.
+    assert.equal(labels[3], "#CampaignViewSet.cancel_reservation");
   });
 
   void it("suggests scoped members for a dotted prefix query", async () => {
