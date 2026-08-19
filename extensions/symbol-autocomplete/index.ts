@@ -2,22 +2,18 @@
  * Extension entry point for symbol autocomplete.
  *
  * Wires up:
- * - Commands: `/rescan-symbols` (async refresh) and `/symbol-autocomplete-status` (status report).
- * - `session_start`: creates SymbolIndexManager, starts async index load/build,
+ * - Commands: `/rescan-symbols` (async tags regeneration) and
+ *   `/symbol-autocomplete-status` (status report).
+ * - `session_start`: creates the TagsManager, starts async tags ensure,
  *   registers `#` autocomplete provider via `ctx.ui.addAutocompleteProvider`.
- * - `before_agent_start`: parses symbol references from prompt, resolves
- *   against index, injects hidden custom message with symbol definitions.
- * - Warmup fail-open: if index is still building at turn time, the turn
+ * - Warmup fail-open: if tags are still building at turn time, the turn
  *   proceeds without injection; a single non-spam warning is shown.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createSymbolIndexManager } from "./symbol-index.ts";
+import { createTagsManager } from "./tags-manager.ts";
 import { createSymbolAutocompleteProvider } from "./autocomplete.ts";
 import { createRescanHandler, createStatusHandler } from "./commands.ts";
-import { parsePrompt } from "./reference-parser.ts";
-import { resolveReferences } from "./resolver.ts";
-import { buildInjectionPayload } from "./injection.ts";
 
 // ── Per-session warmup warning state ────────────────────────────────
 
@@ -37,7 +33,7 @@ function freshWarmupState(): WarmupState {
 export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
   // Shared state — persists across session starts within the same
   // extension runtime (i.e. between `/reload` calls).
-  let indexManager: ReturnType<typeof createSymbolIndexManager> | null = null;
+  let indexManager: ReturnType<typeof createTagsManager> | null = null;
   let warmup = freshWarmupState();
 
   // ── Register commands (once at load time) ─────────────────────────
@@ -56,27 +52,28 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
     // Reset warmup state for the new session
     warmup = freshWarmupState();
 
-    // ── Index manager (uses pi.exec as the underlying executor) ──
-    indexManager = createSymbolIndexManager({
+    // ── Tags manager (uses pi.exec as the underlying executor) ──
+    indexManager = createTagsManager({
       cwd: ctx.cwd,
       executor: (command, args, options) => pi.exec(command, args, options),
     });
 
-    // ── Async index load/build (non-blocking) ─────────────────────
-    indexManager.refresh().catch(() => {
-      // Silently catch — errors are tracked in IndexStatus
+    // ── Async tags ensure (non-blocking) ────────────────────────
+    indexManager.ensure().catch(() => {
+      // Silently catch — errors are tracked in TagsStatus
     });
 
     // ── Register autocomplete provider ────────────────────────────
+    // Todo 3 rewires the provider to query the readtags backend.
     ctx.ui.addAutocompleteProvider((current) =>
-      createSymbolAutocompleteProvider(current, () => indexManager?.getSymbols() ?? []),
+      createSymbolAutocompleteProvider(current, () => []),
     );
   });
 
   // ── Turn-time injection ───────────────────────────────────────────
 
-  pi.on("before_agent_start", async (event, ctx) => {
-    // Guard: no index manager at all
+  pi.on("before_agent_start", async (_event, ctx) => {
+    // Guard: no tags manager at all
     if (!indexManager) return;
 
     const status = indexManager.getStatus();
@@ -93,15 +90,9 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
       return; // skip injection; turn proceeds
     }
 
-    // ── Warmup/fallback engine warning (once per session) ───────────
+    // ── Engine warning (once per session) ───────────────────────────
     if (!warmup.warnedEngine) {
-      if (status.engine === "ast-grep") {
-        ctx.ui.notify(
-          "Symbol autocomplete: tags file/ctags unavailable, using ast-grep fallback. Some symbols may not be detected.",
-          "warning",
-        );
-        warmup.warnedEngine = true;
-      } else if (status.engine === "none" && status.lastError) {
+      if (status.engine === "none" && status.lastError) {
         ctx.ui.notify(
           `Symbol autocomplete: indexing failed (${status.lastError}). Falling back to default autocomplete behavior.`,
           "warning",
@@ -110,57 +101,8 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Skip if no symbols are available (index built but empty)
-    const symbols = indexManager.getSymbols();
-    if (symbols.length === 0) return;
-
-    // Parse symbol references from the prompt
-    const parseResult = parsePrompt(event.prompt);
-    if (parseResult.references.length === 0) return;
-
-    // Resolve against the current symbol index
-    const resolveResult = resolveReferences(parseResult.references, symbols);
-
-    // ── Issue UI warnings for non-injectable refs ──────────────────
-    for (const ref of resolveResult.resolved) {
-      if (ref.status === "unresolved") {
-        ctx.ui.notify(
-          `Symbol autocomplete: "${ref.parsed.name}" not found in index.`,
-          "warning",
-        );
-      } else if (ref.status === "ambiguous") {
-        ctx.ui.notify(
-          `Symbol autocomplete: "${ref.parsed.name}" is ambiguous (multiple matches). Use a stable token or be more specific.`,
-          "warning",
-        );
-      } else if (ref.status === "stale") {
-        ctx.ui.notify(ref.message, "warning");
-      }
-    }
-
-    // ── Build injection payload ─────────────────────────────────────
-    if (resolveResult.injectable.length === 0) return;
-
-    const injection = await buildInjectionPayload(
-      resolveResult.injectable,
-      ctx.cwd,
-    );
-
-    // Nothing to inject (all files failed to read, etc.)
-    if (injection.symbols.length === 0) return;
-
-    // ── Issue cap/missing-file warnings ─────────────────────────────
-    for (const warning of injection.warnings) {
-      ctx.ui.notify(warning, "warning");
-    }
-
-    // ── Inject hidden custom message ────────────────────────────────
-    return {
-      message: {
-        customType: "symbol-context",
-        content: JSON.stringify(injection.symbols),
-        display: false,
-      },
-    };
+    // Todo 4 rewires reference resolution and injection to the
+    // readtags backend. Until then the turn proceeds without injection.
+    return;
   });
 }

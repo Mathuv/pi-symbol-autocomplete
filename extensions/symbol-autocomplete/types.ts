@@ -16,20 +16,22 @@ export interface ProjectSymbol {
   parentName?: string;
 }
 
-/** The indexing engine used to build the symbol catalog. */
-export type IndexEngine = "tags-file" | "ctags" | "ast-grep" | "none";
+/** The engine that produced the current tags file. */
+export type TagsEngine = "tags-file" | "generated" | "none";
 
-/** Status metadata for the symbol index. */
-export interface IndexStatus {
-  /** Which engine produced the current index. */
-  engine: IndexEngine;
-  /** Number of symbols in the current index. */
-  symbolCount: number;
-  /** Timestamp of last successful refresh (ms since epoch), or null if never refreshed. */
-  lastRefresh: number | null;
+/** Status metadata for the tags file. */
+export interface TagsStatus {
+  /** Which engine produced the current tags file. */
+  engine: TagsEngine;
+  /** Absolute path to the tags file. */
+  tagsPath: string;
+  /** Size of the tags file in bytes. */
+  fileSizeBytes: number;
+  /** Last modification time of the tags file (ms since epoch), or null. */
+  mtime: number | null;
   /** Last error message, or null if no error. */
   lastError: string | null;
-  /** Whether a refresh is currently in progress. */
+  /** Whether a build is currently in progress. */
   isBuilding: boolean;
 }
 
@@ -47,35 +49,19 @@ export type Executor = (
   options?: { cwd?: string; timeout?: number },
 ) => Promise<ExecResult>;
 
-/** Configuration for createSymbolIndexManager. */
-export interface SymbolIndexManagerOptions {
-  /** Working directory for the project to index. */
-  cwd: string;
-  /** Executor for running shell commands (pi.exec or mock). */
-  executor: Executor;
-  /** Optional path to a pre-built ctags `tags` file (default: `${cwd}/tags`). */
-  tagsFilePath?: string;
-  /** Additional exclude patterns beyond defaults. */
-  extraExcludes?: string[];
-  /** Timeout in ms for ctags invocation (default 10000). */
-  ctagsTimeout?: number;
-  /** Timeout in ms for ast-grep invocation (default 10000). */
-  astGrepTimeout?: number;
-}
-
-/** Async symbol index manager with ctags→ast-grep fallback. */
-export interface SymbolIndexManager {
+/** Async manager for the tags file lifecycle. */
+export interface TagsManager {
   /**
-   * Trigger an async index build. If a build is already in-flight,
-   * waits for that build and returns (coalesces concurrent calls).
+   * Use the existing tags file or generate one when missing.
+   * Concurrent calls join the same build.
    */
-  refresh(): Promise<void>;
+  ensure(): Promise<void>;
 
-  /** Get a snapshot of the current symbol catalog. */
-  getSymbols(): ProjectSymbol[];
+  /** Always regenerate the tags file with ctags. */
+  regenerate(): Promise<void>;
 
-  /** Get the current index status metadata. */
-  getStatus(): IndexStatus;
+  /** Get the current tags file status metadata. */
+  getStatus(): TagsStatus;
 }
 
 /** Async query backend over a readtags-managed tags file. */

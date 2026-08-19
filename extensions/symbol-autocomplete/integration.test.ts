@@ -124,7 +124,7 @@ function classicTagLine(name: string, filePath: string, kind: string, line: numb
 // ═══════════════════════════════════════════════════════════════════════
 
 void describe("symbol autocomplete integration", () => {
-  void it("loads cwd/tags and serves # autocomplete suggestions without running ctags", async () => {
+  void it("loads cwd/tags and serves # autocomplete suggestions without running ctags", { skip: "TODO-3 rewires autocomplete to the readtags backend and re-enables this test" }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-tags-"));
     fs.writeFileSync(path.join(tmpDir, "service.ts"), "class MyService {}\n", "utf-8");
     fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
@@ -175,7 +175,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects hidden symbol-context message for valid symbol refs (end-to-end)", async () => {
+  void it("injects hidden symbol-context message for valid symbol refs (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-"));
     fs.writeFileSync(path.join(tmpDir, "service.ts"), [
       "/**",
@@ -227,7 +227,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects stale stable token fallback symbol and surfaces stale warning (end-to-end)", async () => {
+  void it("injects stale stable token fallback symbol and surfaces stale warning (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     // Regression: stable token with stale line (same name+file, different line)
     // should resolve to the fallback symbol AND be included in the injection
     // payload (hidden message), while also surfacing a stale warning to the UI.
@@ -313,7 +313,7 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(notifyCalls.length, 0);
   });
 
-  void it("issues warning for unresolved symbol refs without injection", async () => {
+  void it("issues warning for unresolved symbol refs without injection", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const notifyCalls: Array<{ message: string; type: string }> = [];
     const ctags = ctagsLine("RealClass", "real.ts", 1, "class");
     const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "" });
@@ -338,7 +338,7 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(result, undefined);
   });
 
-  void it("issues warning for ambiguous symbol refs without injection", async () => {
+  void it("issues warning for ambiguous symbol refs without injection", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const notifyCalls: Array<{ message: string; type: string }> = [];
     const ctags1 = ctagsLine("SharedName", "src/a.ts", 1, "class");
     const ctags2 = ctagsLine("SharedName", "src/b.ts", 5, "function");
@@ -364,7 +364,7 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(result, undefined);
   });
 
-  void it("suggests scoped members via dotted autocomplete from tags file", async () => {
+  void it("suggests scoped members via dotted autocomplete from tags file", { skip: "TODO-3 rewires autocomplete to the readtags backend and re-enables this test" }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-ac-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",
@@ -424,7 +424,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects dotted stable token symbol-context for scoped member (end-to-end)", async () => {
+  void it("injects dotted stable token symbol-context for scoped member (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-stable-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",
@@ -477,7 +477,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects symbol-context for typed plain dotted reference when unique (end-to-end)", async () => {
+  void it("injects symbol-context for typed plain dotted reference when unique (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-plain-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",

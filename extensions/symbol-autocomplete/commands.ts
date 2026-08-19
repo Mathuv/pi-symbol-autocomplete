@@ -2,12 +2,12 @@
  * Command handlers for symbol autocomplete extension.
  *
  * Provides:
- * - `/rescan-symbols` — async index refresh with coalescing
- * - `/symbol-autocomplete-status` — engine/count/refresh/error/inFlight report
+ * - `/rescan-symbols` — async tags regeneration with coalescing
+ * - `/symbol-autocomplete-status` — engine/file/error/inFlight report
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { SymbolIndexManager } from "./types.ts";
+import type { TagsManager } from "./types.ts";
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -18,7 +18,7 @@ import type { SymbolIndexManager } from "./types.ts";
  * reports that status instead of spawning a duplicate scan.
  */
 export function createRescanHandler(
-  getManager: () => SymbolIndexManager | null,
+  getManager: () => TagsManager | null,
 ): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
   return async (_args: string, ctx: ExtensionCommandContext) => {
     const mgr = getManager();
@@ -37,8 +37,8 @@ export function createRescanHandler(
     }
 
     ctx.ui.notify("Symbol autocomplete: rescanning symbols...", "info");
-    // Fire and forget — errors are tracked in IndexStatus
-    mgr.refresh().catch(() => {});
+    // Fire and forget — errors are tracked in TagsStatus
+    mgr.regenerate().catch(() => {});
   };
 }
 
@@ -50,7 +50,7 @@ export function createRescanHandler(
  * last error (if any).
  */
 export function createStatusHandler(
-  getManager: () => SymbolIndexManager | null,
+  getManager: () => TagsManager | null,
 ): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
   return async (_args: string, ctx: ExtensionCommandContext) => {
     const mgr = getManager();
@@ -62,8 +62,9 @@ export function createStatusHandler(
     const status = mgr.getStatus();
     const fields: string[] = [
       `Engine: ${status.engine}`,
-      `Symbols: ${status.symbolCount}`,
-      `Last refresh: ${status.lastRefresh ? new Date(status.lastRefresh).toISOString() : "never"}`,
+      `Tags: ${status.tagsPath}`,
+      `Size: ${status.fileSizeBytes} bytes`,
+      `Modified: ${status.mtime ? new Date(status.mtime).toISOString() : "never"}`,
       `In flight: ${status.isBuilding}`,
     ];
     if (status.lastError) {
