@@ -137,9 +137,17 @@ export function createTagsManager(options: {
   /**
    * Update the status from the file on disk after a ctags attempt.
    * A missing file clears size and mtime; the engine becomes `none`.
+   * A failed stat keeps the current engine and metadata; only the error
+   * changes, so the stat failure never hides the operation failure.
    */
   async function recordOutcome(lastError: string | null): Promise<void> {
-    const info = await statTags();
+    let info: { size: number; mtime: number } | null;
+    try {
+      info = await statTags();
+    } catch {
+      status = { ...status, lastError };
+      return;
+    }
     if (info === null) {
       status = { ...status, engine: "none", fileSizeBytes: 0, mtime: null, lastError };
       return;
@@ -174,6 +182,10 @@ export function createTagsManager(options: {
     // A queued request uses this count to join this attempt.
     ctagsAttemptId += 1;
 
+    // The ctags or rename failure. A failed cleanup appends its own
+    // context to this instead of replacing the primary failure.
+    let primaryError: string | null = null;
+
     try {
       let result: ExecResult;
       try {
@@ -183,19 +195,22 @@ export function createTagsManager(options: {
           signal: lifetimeController.signal,
         });
       } catch {
-        await recordOutcome(CTAGS_NOT_FOUND);
+        primaryError = CTAGS_NOT_FOUND;
+        await recordOutcome(primaryError);
         return;
       }
 
       // pi.exec resolves a killed run with code 0. A killed ctags must
       // never publish the temp file, even when a partial file exists.
       if (result.killed) {
-        await recordOutcome("ctags timed out");
+        primaryError = "ctags timed out";
+        await recordOutcome(primaryError);
         return;
       }
       if (result.code !== 0) {
         const detail = result.stderr.trim() || `ctags exited with code ${result.code}`;
-        await recordOutcome(`${detail} — ${CTAGS_HINT}`);
+        primaryError = `${detail} — ${CTAGS_HINT}`;
+        await recordOutcome(primaryError);
         return;
       }
 
@@ -208,22 +223,22 @@ export function createTagsManager(options: {
         // Atomically replace the live file only with a complete build.
         await rename(tempTagsPath, resolvedTagsPath);
       } catch {
-        await recordOutcome("ctags failed to write the tags file");
+        primaryError = "ctags failed to write the tags file";
+        await recordOutcome(primaryError);
         return;
       }
       await recordOutcome(null);
     } finally {
       // Never leave a partial temp file behind. ENOENT means the rename
       // already moved it; the live file is never replaced on failure.
-      // Any other cleanup error rejects the operation with the temp path
-      // so shutdown can surface it instead of a successful cleanup.
+      // Any other cleanup error rejects the operation with the primary
+      // failure appended, so shutdown surfaces both failures.
       try {
         await unlink(tempTagsPath);
       } catch (err: unknown) {
         if (errorCode(err) !== "ENOENT") {
-          throw new Error(
-            `failed to remove temporary tags file ${tempTagsPath}: ${err instanceof Error ? err.message : String(err)}`,
-          );
+          const cleanup = `failed to remove temporary tags file ${tempTagsPath}: ${err instanceof Error ? err.message : String(err)}`;
+          throw new Error(primaryError === null ? cleanup : `${primaryError} — ${cleanup}`);
         }
       }
     }
@@ -255,7 +270,9 @@ export function createTagsManager(options: {
 
       await runCtags();
     } catch (err: unknown) {
-      status = { ...status, engine: "none", lastError: err instanceof Error ? err.message : String(err) };
+      // A valid live file keeps the tags-file engine; a missing file
+      // clears to none. The catch never hides the primary failure.
+      await recordOutcome(err instanceof Error ? err.message : String(err));
       // A failed temporary-file cleanup must reject the operation.
       throw err;
     }
@@ -276,7 +293,9 @@ export function createTagsManager(options: {
       }
       await runCtags();
     } catch (err: unknown) {
-      status = { ...status, engine: "none", lastError: err instanceof Error ? err.message : String(err) };
+      // A valid live file keeps the tags-file engine; a missing file
+      // clears to none. The catch never hides the primary failure.
+      await recordOutcome(err instanceof Error ? err.message : String(err));
       // A failed temporary-file cleanup must reject the operation.
       throw err;
     }

@@ -981,4 +981,141 @@ void describe("tags manager cleanup failures", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  void it("combines the ctags failure and the cleanup failure when the live file remains", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean4-"));
+    try {
+      writeSampleTags(tmpDir);
+      const original = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          fs.chmodSync(tmpDir, 0o555);
+          return { code: 1, stdout: "", stderr: "boom", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "tags-file");
+
+      await assert.rejects(
+        manager.regenerate(),
+        /boom.*failed to remove temporary tags file .*\.tags\.tmp-/,
+      );
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "tags-file");
+      assert.ok(status.fileSizeBytes > 0);
+      assert.ok(status.mtime !== null);
+      assert.equal(
+        fs.readFileSync(path.join(tmpDir, "tags"), "utf8"),
+        original,
+        "a failed regeneration must not touch the live file",
+      );
+      assert.match(
+        status.lastError ?? "",
+        /boom.*failed to remove temporary tags file .*\.tags\.tmp-/,
+        "lastError must keep the primary ctags failure and add the cleanup path",
+      );
+
+      fs.chmodSync(tmpDir, 0o755);
+      const shutdownPromise = manager.shutdown();
+      assert.equal(manager.shutdown(), shutdownPromise);
+      await assert.rejects(shutdownPromise, /boom.*failed to remove temporary tags file/);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("combines the rename failure and the cleanup failure when the live file remains", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean5-"));
+    try {
+      writeSampleTags(tmpDir);
+      const original = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          fs.chmodSync(tmpDir, 0o555);
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "tags-file");
+
+      await assert.rejects(
+        manager.regenerate(),
+        /ctags failed to write the tags file.*failed to remove temporary tags file .*\.tags\.tmp-/,
+      );
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "tags-file");
+      assert.ok(status.fileSizeBytes > 0);
+      assert.ok(status.mtime !== null);
+      assert.equal(
+        fs.readFileSync(path.join(tmpDir, "tags"), "utf8"),
+        original,
+        "a failed publication must not touch the live file",
+      );
+      assert.match(
+        status.lastError ?? "",
+        /ctags failed to write the tags file.*failed to remove temporary tags file .*\.tags\.tmp-/,
+        "lastError must keep the primary rename failure and add the cleanup path",
+      );
+
+      fs.chmodSync(tmpDir, 0o755);
+      const shutdownPromise = manager.shutdown();
+      await assert.rejects(shutdownPromise, /ctags failed to write the tags file.*failed to remove temporary tags file/);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("combines the ctags and cleanup failures when no live file exists", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean6-"));
+    try {
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          fs.chmodSync(tmpDir, 0o555);
+          return { code: 1, stdout: "", stderr: "boom", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await assert.rejects(
+        manager.ensure(),
+        /boom.*failed to remove temporary tags file .*\.tags\.tmp-/,
+      );
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "none");
+      assert.equal(status.fileSizeBytes, 0);
+      assert.equal(status.mtime, null);
+      assert.match(
+        status.lastError ?? "",
+        /boom.*failed to remove temporary tags file .*\.tags\.tmp-/,
+        "lastError must include both the ctags and the cleanup failure",
+      );
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
