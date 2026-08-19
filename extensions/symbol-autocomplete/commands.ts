@@ -45,9 +45,9 @@ export function createRescanHandler(
 /**
  * Create a handler for the `/symbol-autocomplete-status` command.
  *
- * Returns a formatted report of the current index status including
- * engine, symbol count, last refresh time, in-flight state, and
- * last error (if any).
+ * Returns a formatted report of the current tags file status including
+ * engine, tags path, file size, last modification time, last error
+ * (if any), and build state.
  */
 export function createStatusHandler(
   getManager: () => TagsManager | null,

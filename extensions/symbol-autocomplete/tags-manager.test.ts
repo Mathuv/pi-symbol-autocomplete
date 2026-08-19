@@ -28,6 +28,7 @@ interface MockOptions {
   readtagsCode?: number;
   ctagsCode?: number;
   ctagsStderr?: string;
+  ctagsKilled?: boolean;
   ctagsThrows?: boolean;
   delayMs?: number;
   /** Runs before a ctags result is returned. Use to create the tags file. */
@@ -58,9 +59,11 @@ function createMockExecutor(options: MockOptions = {}): {
         code: options.ctagsCode ?? 0,
         stdout: "",
         stderr: options.ctagsStderr ?? "",
+        killed: options.ctagsKilled,
       };
     }
-    return { code: 127, stdout: "", stderr: `command not found: ${command}` };
+    // pi.exec resolves missing executables; it does not reject.
+    return { code: 1, stdout: "", stderr: "", killed: false };
   };
   return { executor, calls };
 }
@@ -164,7 +167,7 @@ void describe("tags manager ensure()", () => {
 
       const status = manager.getStatus();
       assert.equal(status.engine, "none");
-      assert.equal(status.lastError, "parse error");
+      assert.match(status.lastError ?? "", /parse error.*install universal-ctags/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -186,6 +189,132 @@ void describe("tags manager ensure()", () => {
     }
   });
 
+  void it("reports the install hint when ctags resolves missing with code 1", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor, calls } = createMockExecutor({
+        ctagsCode: 1,
+        ctagsStderr: "ctags: command not found",
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "none");
+      assert.match(status.lastError ?? "", /ctags: command not found.*install universal-ctags/);
+      assert.equal(calls.filter((c) => c.command === "ctags").length, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("never marks a killed ctags run as generated even with a partial file", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor } = createMockExecutor({
+        ctagsKilled: true,
+        ctagsCode: 0,
+        onCtags: writeTagsAt,
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "tags-file");
+      assert.match(status.lastError ?? "", /ctags timed out/);
+      assert.ok(status.fileSizeBytes > 0, "partial file must keep its size");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("clears stale metadata when a deleted tags file fails to regenerate", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      writeSampleTags(tmpDir);
+      const { executor } = createMockExecutor({ ctagsCode: 1, ctagsStderr: "boom" });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "tags-file");
+      assert.ok(manager.getStatus().fileSizeBytes > 0);
+      assert.ok(manager.getStatus().mtime !== null);
+
+      fs.rmSync(path.join(tmpDir, "tags"));
+      await manager.regenerate();
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "none");
+      assert.equal(status.fileSizeBytes, 0);
+      assert.equal(status.mtime, null);
+      assert.match(status.lastError ?? "", /boom.*install universal-ctags/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("regenerate() joins an in-flight ensure() generation", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      let ctagsRuns = 0;
+      const { executor } = createMockExecutor({
+        delayMs: 20,
+        onCtags: (args) => {
+          ctagsRuns += 1;
+          writeTagsAt(args);
+        },
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      let buildingWhileRegenerateQueued: boolean | null = null;
+      const ensurePromise = manager.ensure().then(() => {
+        buildingWhileRegenerateQueued = manager.getStatus().isBuilding;
+      });
+      const regeneratePromise = manager.regenerate();
+      await Promise.all([ensurePromise, regeneratePromise]);
+
+      assert.equal(ctagsRuns, 1);
+      assert.equal(buildingWhileRegenerateQueued, true);
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("regenerate() queues after an ensure() that finds an existing file", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      let ctagsRuns = 0;
+      const { executor } = createMockExecutor({
+        delayMs: 20,
+        onCtags: (args) => {
+          ctagsRuns += 1;
+          writeTagsAt(args);
+        },
+      });
+
+      writeSampleTags(tmpDir);
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const states: string[] = [];
+      const ensurePromise = manager.ensure().then(() => {
+        states.push(manager.getStatus().isBuilding ? "building" : "settled");
+      });
+      const regeneratePromise = manager.regenerate();
+      await Promise.all([ensurePromise, regeneratePromise]);
+      states.push(manager.getStatus().isBuilding ? "building" : "settled");
+
+      assert.equal(ctagsRuns, 1);
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.equal(manager.getStatus().isBuilding, false);
+      assert.deepEqual(states, ["building", "settled"]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   void it("keeps an existing file with a tags-file engine when regeneration fails", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
@@ -200,7 +329,7 @@ void describe("tags manager ensure()", () => {
 
       const status = manager.getStatus();
       assert.equal(status.engine, "tags-file");
-      assert.equal(status.lastError, "boom");
+      assert.match(status.lastError ?? "", /boom.*install universal-ctags/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
