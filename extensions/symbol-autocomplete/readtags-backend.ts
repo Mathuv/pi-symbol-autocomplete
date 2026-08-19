@@ -14,6 +14,7 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { Transform } from "node:stream";
 
 import {
   type ProjectSymbol,
@@ -24,6 +25,8 @@ import {
 const MAX_RESULTS = 50;
 const MAX_SCANNED_LINES = 10_000;
 const QUERY_TIMEOUT_MS = 5_000;
+const MAX_LINE_BYTES = 64 * 1024;
+const MAX_KIND_ALIASES = 1_000;
 const TAG_KIND_DESCRIPTION_PREFIX = "!_TAG_KIND_DESCRIPTION!";
 
 /**
@@ -209,51 +212,107 @@ export function parseTagLine(line: string, aliases: Map<string, string>): Projec
  * The promise resolves when the stream ends, stops, times out, or aborts.
  */
 function streamReadtags(
+  command: string,
   args: string[],
   cwd: string,
   signal: AbortSignal | undefined,
+  deadline: number,
   onLine: (line: string) => boolean,
 ): Promise<void> {
-  return new Promise((resolve) => {
-    const child = spawn("readtags", args, { cwd, stdio: ["ignore", "pipe", "ignore"] });
-    const lines = createInterface({ input: child.stdout });
-    let finished = false;
-    let timer: NodeJS.Timeout | undefined;
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted || Date.now() >= deadline) {
+      resolve();
+      return;
+    }
 
-    const finish = () => {
+    let child;
+    try {
+      child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "ignore"] });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let finished = false;
+    let stopped = false;
+    let pendingBytes = 0;
+    let timer: NodeJS.Timeout | undefined;
+    let lines: ReturnType<typeof createInterface>;
+
+    const settle = (error?: Error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      child.kill();
+      signal?.removeEventListener("abort", stop);
       lines.close();
-      resolve();
+      if (error) reject(error);
+      else resolve();
     };
 
-    const onAbort = () => finish();
-
-    if (signal?.aborted) {
-      finish();
-      return;
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-    timer = setTimeout(finish, QUERY_TIMEOUT_MS);
-
-    child.on("error", finish);
-    lines.on("close", finish);
-    lines.on("line", (line) => {
+    const stop = () => {
       if (finished) return;
-      if (!onLine(line)) finish();
+      stopped = true;
+      child.kill();
+      settle();
+    };
+
+    const byteCap = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        let start = 0;
+        for (let index = 0; index < chunk.length; index += 1) {
+          if (chunk[index] !== 0x0a) continue;
+          const lineBytes = pendingBytes + index - start;
+          if (lineBytes > MAX_LINE_BYTES) {
+            stop();
+            callback();
+            return;
+          }
+          this.push(chunk.subarray(start, index + 1));
+          pendingBytes = 0;
+          start = index + 1;
+        }
+
+        const tailBytes = chunk.length - start;
+        if (pendingBytes + tailBytes > MAX_LINE_BYTES) {
+          const allowed = MAX_LINE_BYTES - pendingBytes;
+          if (allowed > 0) this.push(chunk.subarray(start, start + allowed));
+          stop();
+          callback();
+          return;
+        }
+        pendingBytes += tailBytes;
+        if (tailBytes > 0) this.push(chunk.subarray(start));
+        callback();
+      },
+    });
+    lines = createInterface({ input: child.stdout.pipe(byteCap) });
+
+    signal?.addEventListener("abort", stop, { once: true });
+    timer = setTimeout(stop, Math.max(0, deadline - Date.now()));
+    child.on("error", (error) => settle(error));
+    child.on("close", (code) => {
+      if (stopped || code === 0) settle();
+      else settle(new Error(`readtags exited with code ${code ?? "signal"}`));
+    });
+    lines.on("line", (line) => {
+      if (!finished && !onLine(line)) stop();
     });
   });
 }
 
 /** Load language kind aliases once from `readtags -D` output. */
-async function loadKindAliases(tagsFilePath: string, cwd: string): Promise<Map<string, string>> {
+async function loadKindAliases(
+  command: string,
+  tagsFilePath: string,
+  cwd: string,
+  signal: AbortSignal | undefined,
+  deadline: number,
+): Promise<Map<string, string>> {
   const aliases = new Map<string, string>();
-  await streamReadtags(["-D", "-t", tagsFilePath], cwd, undefined, (line) => {
+  await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
     if (line.startsWith(TAG_KIND_DESCRIPTION_PREFIX)) {
       parseKindAlias(line, aliases);
+      if (aliases.size >= MAX_KIND_ALIASES) return false;
     }
     return true;
   });
@@ -264,80 +323,96 @@ async function loadKindAliases(tagsFilePath: string, cwd: string): Promise<Map<s
  * Create a readtags query backend.
  * The tags file must already exist at `tagsFilePath`.
  */
-export function createReadtagsBackend(options: { tagsFilePath: string; cwd: string }): ReadtagsBackend {
-  const { tagsFilePath, cwd } = options;
+export function createReadtagsBackend(options: { tagsFilePath: string; cwd: string; readtagsPath?: string }): ReadtagsBackend {
+  const { tagsFilePath, cwd, readtagsPath = "readtags" } = options;
 
   let aliasesPromise: Promise<Map<string, string>> | null = null;
 
-  function getAliases(): Promise<Map<string, string>> {
-    aliasesPromise ??= loadKindAliases(tagsFilePath, cwd);
+  function normalizeLimit(limit: number): number {
+    if (!Number.isFinite(limit)) return MAX_RESULTS;
+    return Math.min(Math.max(Math.trunc(limit), 0), MAX_RESULTS);
+  }
+
+  function getAliases(signal: AbortSignal | undefined, deadline: number): Promise<Map<string, string>> {
+    aliasesPromise ??= loadKindAliases(readtagsPath, tagsFilePath, cwd, signal, deadline);
     return aliasesPromise;
   }
 
-  /**
-   * Run a readtags query with all bounds.
-   * Keeps accepted symbols until `limit` is reached, then kills the child.
-   */
   async function runQuery(
     args: string[],
     limit: number,
     signal: AbortSignal | undefined,
-    accept: (sym: ProjectSymbol) => boolean,
-  ): Promise<ProjectSymbol[]> {
-    const aliases = await getAliases();
-    const symbols: ProjectSymbol[] = [];
-    let scannedLines = 0;
+    collect: (symbol: ProjectSymbol) => boolean,
+  ): Promise<void> {
+    if (limit === 0 || signal?.aborted) return;
 
-    await streamReadtags(args, cwd, signal, (line) => {
+    const deadline = Date.now() + QUERY_TIMEOUT_MS;
+    const aliases = await getAliases(signal, deadline);
+    if (signal?.aborted || Date.now() >= deadline) return;
+
+    let scannedLines = 0;
+    await streamReadtags(readtagsPath, args, cwd, signal, deadline, (line) => {
       scannedLines += 1;
       if (scannedLines > MAX_SCANNED_LINES) return false;
 
-      const sym = parseTagLine(line, aliases);
-      if (sym && accept(sym)) {
-        symbols.push(sym);
-        if (symbols.length >= limit) return false;
-      }
-      return true;
+      const symbol = parseTagLine(line, aliases);
+      return !symbol || collect(symbol);
     });
-
-    return symbols;
   }
 
   return {
     async queryPrefix(query, limit, signal) {
-      return runQuery(
+      const normalizedLimit = normalizeLimit(limit);
+      const symbols: ProjectSymbol[] = [];
+      await runQuery(
         ["-t", tagsFilePath, "-e", "-n", "-p", "-i", "-", query],
-        Math.min(limit, MAX_RESULTS),
+        normalizedLimit,
         signal,
-        () => true,
+        (symbol) => {
+          symbols.push(symbol);
+          return symbols.length < normalizedLimit;
+        },
       );
+      return symbols;
     },
 
     async queryDotted(parentQuery, memberQuery, limit, signal) {
-      const results = await runQuery(
+      const normalizedLimit = normalizeLimit(limit);
+      const exact: ProjectSymbol[] = [];
+      const prefix: ProjectSymbol[] = [];
+      const lowerParent = parentQuery.toLowerCase();
+      await runQuery(
         ["-t", tagsFilePath, "-e", "-n", "-p", "-i", "-", memberQuery],
-        Math.min(limit, MAX_RESULTS),
+        normalizedLimit,
         signal,
-        (sym) => {
-          if (!sym.parentName) return false;
-          return sym.parentName.toLowerCase().startsWith(parentQuery.toLowerCase());
+        (symbol) => {
+          const parentName = symbol.parentName?.toLowerCase();
+          if (!parentName?.startsWith(lowerParent)) return true;
+          if (parentName === lowerParent) {
+            exact.push(symbol);
+            while (exact.length + prefix.length > normalizedLimit) prefix.pop();
+            return exact.length < normalizedLimit;
+          }
+          if (exact.length + prefix.length < normalizedLimit) prefix.push(symbol);
+          return true;
         },
       );
-
-      // Rank exact-parent matches before prefix-parent matches.
-      const lowerParent = parentQuery.toLowerCase();
-      const exact = results.filter((sym) => sym.parentName!.toLowerCase() === lowerParent);
-      const prefix = results.filter((sym) => sym.parentName!.toLowerCase() !== lowerParent);
-      return [...exact, ...prefix];
+      return [...exact, ...prefix].slice(0, normalizedLimit);
     },
 
     async lookupExact(name, limit = MAX_RESULTS) {
-      return runQuery(
+      const normalizedLimit = normalizeLimit(limit);
+      const symbols: ProjectSymbol[] = [];
+      await runQuery(
         ["-t", tagsFilePath, "-e", "-n", "-", name],
-        Math.min(limit, MAX_RESULTS),
+        normalizedLimit,
         undefined,
-        () => true,
+        (symbol) => {
+          symbols.push(symbol);
+          return symbols.length < normalizedLimit;
+        },
       );
+      return symbols;
     },
   };
 }
