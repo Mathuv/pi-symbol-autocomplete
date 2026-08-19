@@ -242,21 +242,32 @@ function streamReadtags(
     let lines: ReturnType<typeof createInterface>;
     let abort: () => void;
 
-    const settle = (error?: Error) => {
-      if (finished) return;
+    const cleanup = () => {
       finished = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       lines.close();
-      if (error) reject(error);
-      else resolve(result);
+    };
+
+    const settleSuccess = () => {
+      if (finished) return;
+      cleanup();
+      resolve(result);
+    };
+
+    // Reject for any thrown value, including falsy ones. A thrown
+    // `undefined` must not resolve a partial scan as if it completed.
+    const settleFailure = (error: unknown) => {
+      if (finished) return;
+      cleanup();
+      reject(error);
     };
 
     const stop = (nextResult: Exclude<StreamResult, "complete">) => {
       if (finished) return;
       result = nextResult;
       child.kill();
-      settle();
+      settleSuccess();
     };
 
     const byteCap = new Transform({
@@ -293,10 +304,10 @@ function streamReadtags(
     abort = () => stop("interrupted");
     signal?.addEventListener("abort", abort, { once: true });
     timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
-    child.on("error", (error) => settle(error));
+    child.on("error", (error) => settleFailure(error));
     child.on("close", (code) => {
-      if (result !== "complete" || code === 0) settle();
-      else settle(new Error(`readtags exited with code ${code ?? "signal"}`));
+      if (result !== "complete" || code === 0) settleSuccess();
+      else settleFailure(new Error(`readtags exited with code ${code ?? "signal"}`));
     });
     lines.on("line", (line) => {
       if (finished) return;
@@ -305,9 +316,10 @@ function streamReadtags(
         keepGoing = onLine(line);
       } catch (error) {
         // A visitor exception must kill the child and reject, not escape
-        // the EventEmitter callback and crash the process.
+        // the EventEmitter callback and crash the process. Falsy thrown
+        // values reject too; they never resolve a partial scan.
         child.kill();
-        settle(error as Error);
+        settleFailure(error);
         return;
       }
       if (!keepGoing) stop("capped");

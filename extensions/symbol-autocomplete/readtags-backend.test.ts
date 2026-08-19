@@ -540,6 +540,26 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
     }
   });
 
+  void it("rejects when the scan visitor throws a falsy value and kills the child", async () => {
+    // P1: a falsy thrown value must still reject the scan, not resolve
+    // a partial scan as if it completed. The child is killed and cleaned up.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      for (const falsy of [undefined, null]) {
+        await assert.rejects(
+          backend.scanExact("Symbol", () => {
+            throw falsy;
+          }),
+          (error: unknown) => error === falsy,
+        );
+      }
+      assert.match(await waitForKill(markerPath), /K\d+/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   void it("returns immediately when the signal is already aborted", async () => {
     const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
     try {
