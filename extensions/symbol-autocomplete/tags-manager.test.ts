@@ -160,7 +160,13 @@ void describe("tags manager ensure()", () => {
       }
       assert.ok(args.some((a) => a.startsWith("--exclude=")), "expected extraExcludes in ctags args");
       assert.ok(args.includes("--exclude=custom-dir"), "expected custom-dir in ctags args");
-      assert.equal(args[args.indexOf("-f") + 1], path.join(tmpDir, "tags"));
+      const tagsTarget = args[args.indexOf("-f") + 1];
+      assert.ok(
+        tagsTarget.startsWith(tmpDir + path.sep),
+        "ctags must write a temp file in the tags directory",
+      );
+      assert.notEqual(tagsTarget, path.join(tmpDir, "tags"), "ctags must not write the live file directly");
+      assert.ok(fs.existsSync(path.join(tmpDir, "tags")), "a complete build must publish the tags file");
       assert.equal(args.at(-1), ".");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -243,7 +249,7 @@ void describe("tags manager ensure()", () => {
     }
   });
 
-  void it("never marks a killed ctags run as generated even with a partial file", async () => {
+  void it("removes the partial temp file and never marks a killed ctags run as generated", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
       const { executor } = createMockExecutor({
@@ -256,9 +262,38 @@ void describe("tags manager ensure()", () => {
       await manager.ensure();
 
       const status = manager.getStatus();
-      assert.equal(status.engine, "tags-file");
+      assert.equal(status.engine, "none");
       assert.match(status.lastError ?? "", /ctags timed out/);
-      assert.ok(status.fileSizeBytes > 0, "partial file must keep its size");
+      assert.equal(status.fileSizeBytes, 0);
+      assert.equal(
+        fs.existsSync(path.join(tmpDir, "tags")),
+        false,
+        "a killed build must never publish a partial file",
+      );
+      assert.deepEqual(fs.readdirSync(tmpDir), [], "the partial temp file must be removed");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("removes the partial temp file after a failed initial build", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      // ctags writes partial output to its temp file, then fails.
+      const { executor } = createMockExecutor({
+        ctagsCode: 1,
+        ctagsStderr: "boom",
+        onCtags: writeTagsAt,
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "none");
+      assert.match(status.lastError ?? "", /boom/);
+      assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false);
+      assert.deepEqual(fs.readdirSync(tmpDir), [], "the partial temp file must be removed");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -361,6 +396,7 @@ void describe("tags manager ensure()", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
       writeSampleTags(tmpDir);
+      const original = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
       const { executor } = createMockExecutor({ ctagsCode: 1, ctagsStderr: "boom" });
 
       const manager = createTagsManager({ cwd: tmpDir, executor });
@@ -372,6 +408,41 @@ void describe("tags manager ensure()", () => {
       const status = manager.getStatus();
       assert.equal(status.engine, "tags-file");
       assert.match(status.lastError ?? "", /boom.*install universal-ctags/);
+      assert.equal(
+        fs.readFileSync(path.join(tmpDir, "tags"), "utf8"),
+        original,
+        "a failed regeneration must not touch the live file",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("atomically replaces the live file only after a complete build", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      writeSampleTags(tmpDir);
+      const { executor } = createMockExecutor({
+        onCtags: (args) => {
+          const target = args[args.indexOf("-f") + 1];
+          assert.notEqual(target, path.join(tmpDir, "tags"), "ctags must write a temp file");
+          fs.writeFileSync(target, "NewClass\tsrc/new.ts\t/^class NewClass$/;\"\tc\tline:1\n");
+        },
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "tags-file");
+
+      await manager.regenerate();
+
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.match(fs.readFileSync(path.join(tmpDir, "tags"), "utf8"), /NewClass/);
+      assert.deepEqual(
+        fs.readdirSync(tmpDir).filter((f) => f.startsWith(".tags.tmp-")),
+        [],
+        "no temp file may remain after a complete build",
+      );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

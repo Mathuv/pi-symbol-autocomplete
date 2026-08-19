@@ -82,9 +82,10 @@ export interface ReadtagsBackend {
   /**
    * Stream every symbol with the exact name `name` through `onSymbol`.
    * The scan runs to normal EOF or rejects as incomplete. It never
-   * accumulates symbols in the backend.
+   * accumulates symbols in the backend. An optional signal aborts the
+   * scan; an aborted scan rejects as incomplete.
    */
-  scanExact(name: string, onSymbol: (symbol: ProjectSymbol) => void): Promise<void>;
+  scanExact(name: string, onSymbol: (symbol: ProjectSymbol) => void, signal?: AbortSignal): Promise<void>;
 }
 
 /** Default directory exclude patterns. */

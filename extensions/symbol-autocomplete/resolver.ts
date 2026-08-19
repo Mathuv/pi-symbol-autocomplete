@@ -20,9 +20,12 @@
  *   - Dotted plain: match by parent + member (unique → resolved, multiple → ambiguous)
  *
  * The backend runs one streamed scan per distinct tag name. Repeated
- * references within one call share the scan. Each reference retains at
- * most two candidates, so memory stays constant regardless of how many
- * tags share a name.
+ * references within one call share the scan. At most 8 distinct names
+ * are admitted, in first-reference order; references for later distinct
+ * names resolve locally as omitted by the limit. One 5 s total deadline
+ * bounds alias loading and every admitted scan. Each reference retains
+ * at most two candidates, so memory stays constant regardless of how
+ * many tags share a name.
  */
 
 import type {
@@ -32,6 +35,13 @@ import type {
   ResolveResult,
   ResolvedReference,
 } from "./types.ts";
+
+// ── Bounds ──────────────────────────────────────────────────────────
+
+/** Distinct lookup names admitted before any subprocess creation. */
+const MAX_LOOKUP_NAMES = 8;
+/** One total deadline across alias loading and all admitted scans. */
+const RESOLVE_DEADLINE_MS = 5_000;
 
 // ── Bounded candidate state ─────────────────────────────────────────
 
@@ -55,21 +65,28 @@ interface StableCandidates {
   stale: ProjectSymbol | null;
 }
 
-type CandidateState = PlainCandidates | StableCandidates;
-
-interface GroupMember {
-  ref: ParsedReference;
-  /** True for stable tokens (exact path+line, else stale fallback). */
-  isStable: boolean;
-  /** Split parts for dotted members. */
-  dotted?: { parentName: string; memberName: string };
-  state: CandidateState;
-}
+type GroupMember =
+  | {
+      kind: "plain";
+      ref: ParsedReference;
+      dotted?: { parentName: string; memberName: string };
+      state: PlainCandidates;
+    }
+  | {
+      kind: "stable";
+      ref: ParsedReference;
+      dotted?: { parentName: string; memberName: string };
+      state: StableCandidates;
+    };
 
 interface KeyGroup {
   key: string;
   members: GroupMember[];
 }
+
+type OrderedSlot =
+  | { kind: "local"; result: ResolvedReference }
+  | { kind: "member"; member: GroupMember };
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -88,10 +105,7 @@ export async function resolveReferences(
   backend: ReadtagsBackend,
 ): Promise<ResolveResult> {
   const groups = new Map<string, KeyGroup>();
-  const ordered: Array<
-    | { kind: "local"; result: ResolvedReference }
-    | { kind: "member"; member: GroupMember }
-  > = [];
+  const ordered: OrderedSlot[] = [];
 
   for (const ref of references) {
     const dotted = splitDottedName(ref.name);
@@ -101,28 +115,40 @@ export async function resolveReferences(
       continue;
     }
 
-    let group = groups.get(key);
-    if (!group) {
-      group = { key, members: [] };
-      groups.set(key, group);
+    const group = groups.get(key);
+    if (group) {
+      const member = makeMember(ref, dotted);
+      group.members.push(member);
+      ordered.push({ kind: "member", member });
+      continue;
     }
-    const member: GroupMember = {
-      ref,
-      isStable: ref.type === "stable",
-      dotted: dotted ?? undefined,
-      state: ref.type === "stable"
-        ? { exact: null, stale: null }
-        : { candidates: [], multiple: false },
-    };
-    group.members.push(member);
+
+    // Admit at most 8 distinct lookup names, in first-reference order,
+    // before any subprocess creation.
+    if (groups.size >= MAX_LOOKUP_NAMES) {
+      ordered.push({ kind: "local", result: limitUnresolved(ref, dotted) });
+      continue;
+    }
+
+    const admitted: KeyGroup = { key, members: [] };
+    const member = makeMember(ref, dotted);
+    admitted.members.push(member);
+    groups.set(key, admitted);
     ordered.push({ kind: "member", member });
   }
 
-  // One scanExact call per distinct key, sequential.
-  for (const group of groups.values()) {
-    await backend.scanExact(group.key, (symbol) => {
-      for (const member of group.members) updateCandidates(member, symbol);
-    });
+  // One scanExact call per admitted key, sequential, under ONE total
+  // deadline. A deadline abort rejects the active scan and this call.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESOLVE_DEADLINE_MS);
+  try {
+    for (const group of groups.values()) {
+      await backend.scanExact(group.key, (symbol) => {
+        for (const member of group.members) updateCandidates(member, symbol);
+      }, controller.signal);
+    }
+  } finally {
+    clearTimeout(timer);
   }
 
   const resolved = ordered.map((slot) =>
@@ -136,6 +162,17 @@ export async function resolveReferences(
 }
 
 // ── Internal resolution logic ───────────────────────────────────────
+
+/** Build the bounded candidate state for one reference. */
+function makeMember(
+  ref: ParsedReference,
+  dotted: { parentName: string; memberName: string } | null,
+): GroupMember {
+  const shared = { ref, dotted: dotted ?? undefined };
+  return ref.type === "stable"
+    ? { ...shared, kind: "stable" as const, state: { exact: null, stale: null } }
+    : { ...shared, kind: "plain" as const, state: { candidates: [], multiple: false } };
+}
 
 /**
  * Return the exact tag name a reference scans, or null when it resolves
@@ -176,6 +213,20 @@ function localUnresolved(
   return { parsed: ref, symbol: null, status: "unresolved", message };
 }
 
+/** Build the unresolved outcome for a name omitted by the lookup limit. */
+function limitUnresolved(
+  ref: ParsedReference,
+  dotted: { parentName: string; memberName: string } | null,
+): ResolvedReference {
+  const label = dotted ? `${dotted.parentName}.${dotted.memberName}` : ref.name;
+  return {
+    parsed: ref,
+    symbol: null,
+    status: "unresolved",
+    message: `Unresolved ${label}: the 8-name lookup limit omitted this reference`,
+  };
+}
+
 /**
  * Split a dotted name into parent and member parts.
  * Returns null if the name doesn't contain a valid dot separation.
@@ -212,49 +263,46 @@ function matchesIdentity(member: GroupMember, symbol: ProjectSymbol): boolean {
 function updateCandidates(member: GroupMember, symbol: ProjectSymbol): void {
   if (!matchesIdentity(member, symbol)) return;
 
-  if (member.isStable) {
-    const stable = member.state as StableCandidates;
+  if (member.kind === "stable") {
     if (
-      stable.exact === null &&
+      member.state.exact === null &&
       symbol.path === member.ref.path &&
       symbol.line === member.ref.line
     ) {
-      stable.exact = symbol;
+      member.state.exact = symbol;
     }
-    if (stable.stale === null && symbol.path === member.ref.path) {
-      stable.stale = symbol;
+    if (member.state.stale === null && symbol.path === member.ref.path) {
+      member.state.stale = symbol;
     }
     return;
   }
 
-  const plain = member.state as PlainCandidates;
-  if (plain.candidates.length < 2) plain.candidates.push(symbol);
-  else plain.multiple = true;
+  if (member.state.candidates.length < 2) member.state.candidates.push(symbol);
+  else member.state.multiple = true;
 }
 
 /** Derive the resolution outcome from the retained candidates. */
 function deriveResult(member: GroupMember): ResolvedReference {
-  const { ref, isStable, dotted } = member;
+  const { ref, dotted } = member;
   const label = dotted ? `${dotted.parentName}.${dotted.memberName}` : ref.name;
 
-  if (isStable) {
-    const stable = member.state as StableCandidates;
-    if (stable.exact) {
+  if (member.kind === "stable") {
+    if (member.state.exact) {
       return {
         parsed: ref,
-        symbol: stable.exact,
+        symbol: member.state.exact,
         status: "resolved",
         message: dotted
-          ? `Resolved via exact parent+member+path+line: ${label}@${stable.exact.path}:${stable.exact.line}`
-          : `Resolved via exact name+path+line: ${label}@${stable.exact.path}:${stable.exact.line}`,
+          ? `Resolved via exact parent+member+path+line: ${label}@${member.state.exact.path}:${member.state.exact.line}`
+          : `Resolved via exact name+path+line: ${label}@${member.state.exact.path}:${member.state.exact.line}`,
       };
     }
-    if (stable.stale) {
+    if (member.state.stale) {
       return {
         parsed: ref,
-        symbol: stable.stale,
+        symbol: member.state.stale,
         status: "stale",
-        message: `Stable token line ${ref.line} is stale; resolved to ${label} at ${stable.stale.path}:${stable.stale.line}`,
+        message: `Stable token line ${ref.line} is stale; resolved to ${label} at ${member.state.stale.path}:${member.state.stale.line}`,
       };
     }
     return {
@@ -265,9 +313,8 @@ function deriveResult(member: GroupMember): ResolvedReference {
     };
   }
 
-  const plain = member.state as PlainCandidates;
-  if (plain.candidates.length === 1) {
-    const symbol = plain.candidates[0];
+  if (member.state.candidates.length === 1) {
+    const symbol = member.state.candidates[0];
     return {
       parsed: ref,
       symbol,
@@ -278,7 +325,7 @@ function deriveResult(member: GroupMember): ResolvedReference {
     };
   }
 
-  if (plain.candidates.length === 0) {
+  if (member.state.candidates.length === 0) {
     return {
       parsed: ref,
       symbol: null,
@@ -290,8 +337,8 @@ function deriveResult(member: GroupMember): ResolvedReference {
   }
 
   // Two or more matches. The diagnostic lists only the retained paths.
-  const paths = plain.candidates.map((s) => `${s.path}:${s.line}`).join(", ");
-  const extra = plain.multiple ? " (more than two matches)" : "";
+  const paths = member.state.candidates.map((s) => `${s.path}:${s.line}`).join(", ");
+  const extra = member.state.multiple ? " (more than two matches)" : "";
   return {
     parsed: ref,
     symbol: null,

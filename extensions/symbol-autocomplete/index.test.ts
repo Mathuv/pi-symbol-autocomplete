@@ -540,6 +540,79 @@ void describe("symbol autocomplete extension", () => {
       }
     });
 
+    void it("fails open when the resolver total deadline aborts the scans", { timeout: 10_000 }, async () => {
+      // The backend hangs until the resolver's shared signal aborts at the
+      // 5 s total deadline. The extension must warn once, inject nothing,
+      // and bound the resolution time to one deadline, not N × 5 s.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-dl-"));
+
+      try {
+        const executor: Executor = async (command: string) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            fs.writeFileSync(
+              path.join(tmpDir, "tags"),
+              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
+            );
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        };
+
+        const pi = createMockPi(executor);
+        const createBackend = () => ({
+          queryPrefix: async () => [],
+          queryDotted: async () => [],
+          scanExact: async (_name: string, _onSymbol: unknown, signal?: AbortSignal) => {
+            if (!signal) throw new Error("resolver must pass its total-deadline signal");
+            await new Promise((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("resolver deadline")),
+                { once: true },
+              );
+            });
+          },
+        });
+        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+        const sessionStartHandler = pi.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
+          | undefined;
+        assert.ok(sessionStartHandler);
+        assert.ok(beforeAgentStartHandler);
+
+        const notifyCalls: Array<{ message: string; type: string }> = [];
+        const sessionCtx = createMockCtx({
+          cwd: tmpDir,
+          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+        });
+
+        sessionStartHandler?.({}, sessionCtx as any);
+        await new Promise((r) => setTimeout(r, 50));
+
+        const started = Date.now();
+        const result = await beforeAgentStartHandler?.(
+          { ...createPromptEventPartial(), prompt: "#MyService\n#OtherA\n#OtherB" },
+          sessionCtx as any,
+        );
+        const elapsed = Date.now() - started;
+
+        assert.equal(result, undefined, "a deadline abort must skip injection");
+        const failureWarnings = notifyCalls.filter((c) => c.message.includes("lookup failed"));
+        assert.equal(failureWarnings.length, 1, "warn exactly once");
+        assert.equal(failureWarnings[0].type, "warning");
+        assert.ok(elapsed < 5_500, `the total deadline must bound resolution (took ${elapsed} ms)`);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     void it("recreates manager and backend per session cwd without stale closures", async () => {
       const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-a-"));
       const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-b-"));
@@ -668,8 +741,8 @@ void describe("symbol autocomplete extension", () => {
         await new Promise((r) => setTimeout(r, 50));
 
         assert.equal(
-          ctagsTargets[ctagsTargets.length - 1],
-          path.join(dirB, "tags"),
+          ctagsTargets[ctagsTargets.length - 1].startsWith(dirB + path.sep),
+          true,
           "rescan must regenerate the current session's tags file",
         );
       } finally {

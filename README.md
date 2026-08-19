@@ -64,12 +64,14 @@ Symbols are indexed with Universal Ctags into a `tags` file at the repository ro
 At session start, the extension uses an existing `tags` file as-is. When the file is missing, the extension generates it with:
 
 ```text
-ctags --recurse --sort=foldcase --fields=+KznZe <default excludes> -f tags .
+ctags --recurse --sort=foldcase --fields=+KznZe <default excludes> -f <temporary file> .
 ```
+
+ctags writes to a unique temporary file in the same directory as `tags`. When the build completes, the extension atomically renames the temporary file to `tags`. A failed, timed-out, or interrupted build removes the temporary file and never touches an existing `tags` file. A failed initial build leaves no `tags` file and disables symbol autocomplete with the error message.
 
 The default excludes skip heavy, vendor, and generated directories such as `.git`, `node_modules`, `dist`, `build`, `.next`, `coverage`, `vendor`, caches, and similar paths.
 
-`/rescan-symbols` always regenerates the `tags` file with the same command and overwrites the existing file.
+`/rescan-symbols` always regenerates the `tags` file with the same command and replaces the existing file only when the new build completes.
 
 The extension requires the Universal Ctags tools `ctags` and `readtags` on `PATH`. When `readtags` is missing or the tags file cannot be read, symbol autocomplete disables with a one-time warning. There is no in-memory fallback index.
 
@@ -83,6 +85,7 @@ The tags file stays on disk. Each query runs a `readtags` subprocess whose outpu
 
 - Max 50 autocomplete results.
 - Max 8 symbol payloads per prompt.
+- At most 8 distinct symbol names are looked up per prompt; later distinct names resolve as omitted with a warning. All lookups share one 5-second total deadline.
 - About 3000 chars per symbol payload.
 - Truncated payloads include `...[truncated]`.
 - Warnings are shown via Pi UI notifications only; warnings are not injected into the prompt.

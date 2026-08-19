@@ -18,8 +18,9 @@
  * shares one ctags command.
  */
 
-import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { rename, stat, unlink } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 import {
   type ExecResult,
@@ -132,39 +133,57 @@ export function createTagsManager(options: {
 
   /** Run one ctags command and record the outcome. */
   async function runCtags(): Promise<void> {
+    // ctags writes to a unique temporary file in the tags directory. The
+    // live file is replaced atomically only after a complete build, so a
+    // failed build never leaves a partial live tags file.
+    const tempTagsPath = join(dirname(resolvedTagsPath), `.tags.tmp-${process.pid}-${randomUUID()}`);
     const args = [
       "--recurse",
       "--sort=foldcase",
       "--fields=+KznZe",
       ...buildExcludeArgs(extraExcludes),
       "-f",
-      resolvedTagsPath,
+      tempTagsPath,
       ".",
     ];
 
     // A queued request uses this count to join this attempt.
     ctagsAttemptId += 1;
 
-    let result: ExecResult;
     try {
-      result = await executor("ctags", args, { cwd, timeout: ctagsTimeout });
-    } catch {
-      await recordOutcome(CTAGS_NOT_FOUND);
-      return;
-    }
+      let result: ExecResult;
+      try {
+        result = await executor("ctags", args, { cwd, timeout: ctagsTimeout });
+      } catch {
+        await recordOutcome(CTAGS_NOT_FOUND);
+        return;
+      }
 
-    // pi.exec resolves a killed run with code 0. A killed ctags must never
-    // mark the file as generated, even when a partial file exists.
-    if (result.killed) {
-      await recordOutcome("ctags timed out");
-      return;
+      // pi.exec resolves a killed run with code 0. A killed ctags must
+      // never publish the temp file, even when a partial file exists.
+      if (result.killed) {
+        await recordOutcome("ctags timed out");
+        return;
+      }
+      if (result.code !== 0) {
+        const detail = result.stderr.trim() || `ctags exited with code ${result.code}`;
+        await recordOutcome(`${detail} — ${CTAGS_HINT}`);
+        return;
+      }
+
+      try {
+        // Atomically replace the live file only with a complete build.
+        await rename(tempTagsPath, resolvedTagsPath);
+      } catch {
+        await recordOutcome("ctags failed to write the tags file");
+        return;
+      }
+      await recordOutcome(null);
+    } finally {
+      // Never leave a partial temp file behind. ENOENT means the rename
+      // already moved it; the live file is never replaced on failure.
+      await unlink(tempTagsPath).catch(() => {});
     }
-    if (result.code !== 0) {
-      const detail = result.stderr.trim() || `ctags exited with code ${result.code}`;
-      await recordOutcome(`${detail} — ${CTAGS_HINT}`);
-      return;
-    }
-    await recordOutcome(null);
   }
 
   /**

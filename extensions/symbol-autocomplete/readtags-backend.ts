@@ -24,7 +24,9 @@ import {
 
 const MAX_RESULTS = 50;
 const MAX_SCANNED_LINES = 10_000;
+const MAX_ALIAS_LINES = 10_000;
 const QUERY_TIMEOUT_MS = 5_000;
+const STOP_GRACE_MS = 200;
 const MAX_LINE_BYTES = 64 * 1024;
 const MAX_KIND_ALIASES = 1_000;
 const TAG_KIND_DESCRIPTION_PREFIX = "!_TAG_KIND_DESCRIPTION!";
@@ -236,17 +238,24 @@ function streamReadtags(
     }
 
     let finished = false;
+    let failed = false;
+    let failure: unknown;
     let result: StreamResult = "complete";
     let pendingBytes = 0;
     let timer: NodeJS.Timeout | undefined;
+    let graceTimer: NodeJS.Timeout | undefined;
+    let childClosed = false;
+    let stopping = false;
     let lines: ReturnType<typeof createInterface>;
     let abort: () => void;
 
     const cleanup = () => {
       finished = true;
       clearTimeout(timer);
+      clearTimeout(graceTimer);
       signal?.removeEventListener("abort", abort);
       lines.close();
+      byteCap.destroy();
     };
 
     const settleSuccess = () => {
@@ -263,11 +272,29 @@ function streamReadtags(
       reject(error);
     };
 
+    // Stop the child and settle only after its close event. A short
+    // grace timer escalates to SIGKILL when the child ignores SIGTERM,
+    // so the promise never settles while the child remains alive.
     const stop = (nextResult: Exclude<StreamResult, "complete">) => {
-      if (finished) return;
+      if (finished || stopping) return;
+      stopping = true;
+      clearTimeout(timer);
       result = nextResult;
       child.kill();
-      settleSuccess();
+      if (childClosed) settleSuccess();
+      else graceTimer = setTimeout(() => child.kill("SIGKILL"), STOP_GRACE_MS);
+    };
+
+    // Stop the child for a visitor failure and reject after close.
+    const stopFailure = (error: unknown) => {
+      if (finished || stopping) return;
+      stopping = true;
+      clearTimeout(timer);
+      failed = true;
+      failure = error;
+      child.kill();
+      if (childClosed) settleFailure(error);
+      else graceTimer = setTimeout(() => child.kill("SIGKILL"), STOP_GRACE_MS);
     };
 
     const byteCap = new Transform({
@@ -306,11 +333,14 @@ function streamReadtags(
     timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
     child.on("error", (error) => settleFailure(error));
     child.on("close", (code) => {
-      if (result !== "complete" || code === 0) settleSuccess();
+      childClosed = true;
+      clearTimeout(graceTimer);
+      if (failed) settleFailure(failure);
+      else if (result !== "complete" || code === 0) settleSuccess();
       else settleFailure(new Error(`readtags exited with code ${code ?? "signal"}`));
     });
     lines.on("line", (line) => {
-      if (finished) return;
+      if (finished || stopping) return;
       let keepGoing: boolean;
       try {
         keepGoing = onLine(line);
@@ -318,8 +348,7 @@ function streamReadtags(
         // A visitor exception must kill the child and reject, not escape
         // the EventEmitter callback and crash the process. Falsy thrown
         // values reject too; they never resolve a partial scan.
-        child.kill();
-        settleFailure(error);
+        stopFailure(error);
         return;
       }
       if (!keepGoing) stop("capped");
@@ -336,14 +365,24 @@ async function loadKindAliases(
   deadline: number,
 ): Promise<{ aliases: Map<string, string>; complete: boolean }> {
   const aliases = new Map<string, string>();
+  let lineCount = 0;
+  let aliasCapReached = false;
   const result = await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
+    lineCount += 1;
+    // The line cap marks the load incomplete; the stored-alias cap is
+    // complete by design.
+    if (lineCount > MAX_ALIAS_LINES) return false;
     if (line.startsWith(TAG_KIND_DESCRIPTION_PREFIX)) {
       parseKindAlias(line, aliases);
-      if (aliases.size >= MAX_KIND_ALIASES) return false;
+      if (aliases.size >= MAX_KIND_ALIASES) {
+        aliasCapReached = true;
+        return false;
+      }
     }
     return true;
   });
-  return { aliases, complete: result !== "interrupted" };
+  const complete = result === "complete" || (result === "capped" && aliasCapReached);
+  return { aliases, complete };
 }
 
 /**
@@ -379,6 +418,25 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
     return aliasesPromise;
   }
 
+  /**
+   * Load aliases for one query, retrying once after a shared-load
+   * interruption. A partial alias map never reaches a query.
+   */
+  async function loadAliases(
+    signal: AbortSignal | undefined,
+    deadline: number,
+  ): Promise<Map<string, string>> {
+    const first = await getAliases(signal, deadline);
+    if (first.complete) return first.aliases;
+    // The caller stopped; the caller discards the partial map.
+    if (signal?.aborted || Date.now() >= deadline) return first.aliases;
+    // Another caller aborted the shared load. Retry once with a fresh
+    // load; a still-incomplete load rejects instead of using partial data.
+    const second = await getAliases(signal, deadline);
+    if (second.complete) return second.aliases;
+    throw new Error("kind alias loading did not complete");
+  }
+
   async function runQuery(
     args: string[],
     limit: number,
@@ -388,7 +446,7 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
     if (limit === 0 || signal?.aborted) return;
 
     const deadline = Date.now() + QUERY_TIMEOUT_MS;
-    const { aliases } = await getAliases(signal, deadline);
+    const aliases = await loadAliases(signal, deadline);
     if (signal?.aborted || Date.now() >= deadline) return;
 
     let scannedLines = 0;
@@ -441,9 +499,9 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
       return [...exact, ...prefix].slice(0, normalizedLimit);
     },
 
-    async scanExact(name, onSymbol) {
+    async scanExact(name, onSymbol, signal) {
       const deadline = Date.now() + QUERY_TIMEOUT_MS;
-      const { aliases, complete } = await getAliases(undefined, deadline);
+      const { aliases, complete } = await getAliases(signal, deadline);
       if (!complete) {
         throw new Error(`kind alias loading was interrupted; exact scan of "${name}" aborted`);
       }
@@ -453,7 +511,7 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
         readtagsPath,
         ["-t", tagsFilePath, "-e", "-n", "-", name],
         cwd,
-        undefined,
+        signal,
         deadline,
         (line) => {
           scannedLines += 1;

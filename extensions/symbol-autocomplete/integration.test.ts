@@ -105,12 +105,6 @@ function createPromptEvent(prompt: string) {
 
 // ── Ctags data helpers ─────────────────────────────────────────────
 
-function ctagsLine(name: string, path: string, line: number, kind: string, scope?: string): string {
-  const tag: Record<string, unknown> = { _type: "tag", name, path, pattern: "/^" + kind + " " + name + "/", line, kind };
-  if (scope) tag.scope = scope;
-  return JSON.stringify(tag);
-}
-
 function classicTagsFile(lines: string[]): string {
   return [
     "!_TAG_FILE_FORMAT\t2\t/extended format/",
@@ -363,24 +357,39 @@ void describe("symbol autocomplete integration", () => {
   });
 
   void it("returns undefined when prompt has no symbol references", async () => {
-    const notifyCalls: Array<{ message: string; type: string }> = [];
-    const ctags = ctagsLine("SomeClass", "test.ts", 1, "class");
-    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
-    const pi = createMockPi(executor);
-    symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-noref-"));
+    try {
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      // A healthy engine: the probe succeeds and ctags writes a tags file.
+      const executor = async (command: string, args: string[]) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          const target = args[args.indexOf("-f") + 1];
+          fs.writeFileSync(target, "SomeClass\ttest.ts\t/^class SomeClass$/;\"\tc\tline:1\n");
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      };
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
-    const ctx = createContext("/test/project", notifyCalls, executor);
+      const ctx = createContext(tmpDir, notifyCalls, executor);
 
-    pi.handlers.get("session_start")({}, ctx);
-    await new Promise((r) => setTimeout(r, 100));
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 100));
 
-    const result = await pi.handlers.get("before_agent_start")(
-      createPromptEvent("Hello, can you help me with something?"),
-      ctx,
-    );
+      const result = await pi.handlers.get("before_agent_start")(
+        createPromptEvent("Hello, can you help me with something?"),
+        ctx,
+      );
 
-    assert.equal(result, undefined);
-    assert.equal(notifyCalls.length, 0);
+      assert.equal(result, undefined);
+      assert.equal(notifyCalls.length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   void it("issues warning for unresolved symbol refs without injection", { skip: SKIP_NO_READTAGS }, async () => {

@@ -659,6 +659,77 @@ void describe("resolver", () => {
     );
   });
 
+  void it("admits at most 8 distinct lookup names and omits later names", async () => {
+    const names = ["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+    const symbols: ProjectSymbol[] = names.map((name, index) => ({
+      name,
+      kind: "class",
+      path: `src/${name.toLowerCase()}.ts`,
+      line: index + 1,
+    }));
+    const { backend, scanCalls } = createMockBackend(symbols);
+    const parsed = parsePrompt(names.map((n) => `#${n}`).join("\n"));
+    const result = await resolveReferences(parsed.references, backend);
+
+    assert.deepEqual(scanCalls, names.slice(0, 8), "only the first 8 distinct names may scan");
+    assert.equal(result.resolved.length, 9);
+    assert.ok(result.resolved.slice(0, 8).every((r) => r.status === "resolved"));
+    const ninth = result.resolved[8];
+    assert.equal(ninth.status, "unresolved");
+    assert.equal(ninth.symbol, null);
+    assert.match(ninth.message, /8-name lookup limit/);
+    assert.equal(result.injectable.length, 8);
+  });
+
+  void it("keeps shared names in one admitted scan across the limit", async () => {
+    const names = ["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+    const symbols: ProjectSymbol[] = names.map((name, index) => ({
+      name,
+      kind: "class",
+      path: `src/${name.toLowerCase()}.ts`,
+      line: index + 1,
+    }));
+    const { backend, scanCalls } = createMockBackend(symbols);
+    // Nine distinct names plus a repeated reference to B.
+    const parsed = parsePrompt(names.map((n) => `#${n}`).join("\n") + "\n#B");
+    const result = await resolveReferences(parsed.references, backend);
+
+    assert.deepEqual(scanCalls, names.slice(0, 8));
+    assert.equal(result.resolved.length, 10);
+    const bRefs = result.resolved.filter((r) => r.parsed.name === "B");
+    assert.equal(bRefs.length, 2);
+    assert.ok(bRefs.every((r) => r.status === "resolved"));
+    assert.equal(scanCalls.filter((n) => n === "B").length, 1, "shared names use one scan");
+    const omitted = result.resolved.find((r) => r.parsed.name === "I");
+    assert.equal(omitted?.status, "unresolved");
+    assert.match(omitted?.message ?? "", /8-name lookup limit/);
+  });
+
+  void it("bounds all admitted scans with one total deadline", { timeout: 10_000 }, async () => {
+    // Each scan hangs until the shared resolver signal aborts at the
+    // 5 s total deadline. The active scan must receive the abort instead
+    // of each scan running its own 5 s window.
+    const backend: ReadtagsBackend = {
+      queryPrefix: async () => [],
+      queryDotted: async () => [],
+      scanExact: async (_name, _onSymbol, signal) => {
+        if (!signal) throw new Error("resolver must pass its total-deadline signal");
+        await new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new Error("resolver deadline aborted the scan")),
+            { once: true },
+          );
+        });
+      },
+    };
+    const parsed = parsePrompt(["#A", "#B", "#C"].join("\n"));
+    const started = Date.now();
+    await assert.rejects(resolveReferences(parsed.references, backend), /resolver deadline aborted/);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 5_500, `three scans must not consume 3 × 5 s (took ${elapsed} ms)`);
+  });
+
   // ── Edge cases ──────────────────────────────────────────────────
 
   void it("handles empty symbol index", async () => {

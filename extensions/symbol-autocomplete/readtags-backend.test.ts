@@ -188,6 +188,16 @@ if (alias) {
       process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc" + index + ",class\\n");
     }
     setInterval(() => {}, 1000);
+  } else if (mode === "alias-10k") {
+    for (let index = 0; index < 10_000; index += 1) {
+      process.stdout.write("!_TAG_FILE_SORTED\\t2\\t/0=unsorted, 1=sorted, 2=foldcase/\\n");
+    }
+    process.stdout.end(() => process.exit(0));
+  } else if (mode === "alias-10001") {
+    for (let index = 0; index < 10_001; index += 1) {
+      process.stdout.write("!_TAG_FILE_SORTED\\t2\\t/0=unsorted, 1=sorted, 2=foldcase/\\n");
+    }
+    setInterval(() => {}, 1000);
   } else {
     process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc,class\\n");
     process.exit(0);
@@ -202,6 +212,12 @@ if (alias) {
 } else if (mode === "alias-symbol") {
   process.stdout.write("Aliased\\ta.ts\\tpattern\\tkind:c\\tline:1\\tlanguage:TypeScript\\n");
   process.exit(0);
+} else if (mode === "no-term") {
+  fs.appendFileSync(marker, "PID" + process.pid + "\\n");
+  process.removeAllListeners("SIGTERM");
+  process.on("SIGTERM", () => {});
+  process.stdout.write("Symbol0\\ta.ts\\t/^Symbol$/;\\\"\\tkind:class\\tline:1\\n");
+  setInterval(() => {}, 1000);
 } else {
   const total = mode === "scanned" ? 15_000 : 1_000;
   function emit() {
@@ -350,6 +366,83 @@ void describe("readtags backend bounds", () => {
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       assert.equal((await backend.queryPrefix("symbol", Number.NaN)).length, 50);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("completes an alias load of exactly 10,000 lines and caches it", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-10k");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const symbols = await backend.queryPrefix("symbol", 1);
+      assert.equal(symbols.length, 1);
+      assert.equal(symbols[0].name, "Symbol0");
+      // The complete load is cached; a second query does not re-run -D.
+      await backend.queryPrefix("symbol", 1);
+      assert.equal(readMarker(markerPath).match(/D/g)?.length, 1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("rejects an alias load past the 10,000-line cap as incomplete", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-10001");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      await assert.rejects(backend.queryPrefix("symbol", 1), /did not complete/);
+      assert.match(await waitForKill(markerPath), /K\d+/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("keeps an active caller's alias load complete when the first caller aborts", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const aController = new AbortController();
+      const bController = new AbortController();
+
+      // A starts the shared alias load; B joins it while the load is in flight.
+      const aQuery = backend.queryPrefix("aliased", 50, aController.signal);
+      assert.match(await waitForMarker(markerPath, "D"), /D/);
+      const bQuery = backend.queryPrefix("aliased", 50, bController.signal);
+
+      // Point B's retry at a tags file that serves a complete alias load,
+      // then abort A. The shared load dies with A, but B must not inherit
+      // the abort or consume the partial alias map.
+      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      aController.abort();
+      assert.deepEqual(await aQuery, []);
+
+      const symbols = await bQuery;
+      assert.deepEqual(symbols.map((symbol) => symbol.name), ["Aliased"]);
+      assert.equal(symbols[0].kind, "class");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("kills a SIGTERM-ignoring child with SIGKILL after a grace period", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("no-term");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const started = Date.now();
+      const symbols = await backend.queryPrefix("symbol", 1);
+      const elapsed = Date.now() - started;
+
+      assert.equal(symbols.length, 1);
+      assert.equal(symbols[0].name, "Symbol0");
+
+      const marker = readMarker(markerPath);
+      assert.match(marker, /PID\d+/);
+      assert.ok(!marker.includes("K"), "the SIGTERM handler must not run");
+      assert.ok(elapsed >= 150, `SIGKILL grace must elapse before close (took ${elapsed} ms)`);
+
+      // The promise settled via close; the child must be dead, not a survivor.
+      const pid = Number.parseInt(marker.match(/PID(\d+)/)![1], 10);
+      assert.throws(() => process.kill(pid, 0), "the child must be dead after resolution");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
