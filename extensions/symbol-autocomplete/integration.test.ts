@@ -21,7 +21,7 @@ import symbolAutocompleteExtension from "./index.ts";
 // ── Mock PI ────────────────────────────────────────────────────────
 
 function createMockPi(
-  executor: (cmd: string, args: string[], options?: unknown) => Promise<{ code: number; stdout: string; stderr: string }> = async () => ({ code: 0, stdout: "", stderr: "" }),
+  executor: (cmd: string, args: string[], options?: unknown) => Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> = async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
 ): any {
   const commands = new Map();
   const handlers = new Map();
@@ -61,7 +61,7 @@ function createMockPi(
 function createContext(
   cwd: string,
   notifyCalls: Array<{ message: string; type: string }>,
-  executor: (cmd: string, ...args: unknown[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+  executor: (cmd: string, ...args: unknown[]) => Promise<{ code: number; stdout: string; stderr: string; killed: boolean }>,
 ): any {
   return {
     cwd,
@@ -135,7 +135,7 @@ void describe("symbol autocomplete integration", () => {
       let commandCalls = 0;
       const executor = async () => {
         commandCalls++;
-        return { code: 127, stdout: "", stderr: "should not run" };
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
       };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
@@ -191,7 +191,7 @@ void describe("symbol autocomplete integration", () => {
     try {
       const notifyCalls: Array<{ message: string; type: string }> = [];
       const ctags = ctagsLine("MyService", "service.ts", 4, "class");
-      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "" });
+      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -247,7 +247,7 @@ void describe("symbol autocomplete integration", () => {
       const notifyCalls: Array<{ message: string; type: string }> = [];
       // Symbol at line 4, but stable token will reference a stale line (99)
       const ctags = ctagsLine("MyService", "service.ts", 4, "class");
-      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "" });
+      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -295,7 +295,7 @@ void describe("symbol autocomplete integration", () => {
   void it("returns undefined when prompt has no symbol references", async () => {
     const notifyCalls: Array<{ message: string; type: string }> = [];
     const ctags = ctagsLine("SomeClass", "test.ts", 1, "class");
-    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "" });
+    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
     const pi = createMockPi(executor);
     symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -316,7 +316,7 @@ void describe("symbol autocomplete integration", () => {
   void it("issues warning for unresolved symbol refs without injection", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
     const notifyCalls: Array<{ message: string; type: string }> = [];
     const ctags = ctagsLine("RealClass", "real.ts", 1, "class");
-    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "" });
+    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
     const pi = createMockPi(executor);
     symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -342,7 +342,7 @@ void describe("symbol autocomplete integration", () => {
     const notifyCalls: Array<{ message: string; type: string }> = [];
     const ctags1 = ctagsLine("SharedName", "src/a.ts", 1, "class");
     const ctags2 = ctagsLine("SharedName", "src/b.ts", 5, "function");
-    const executor = async () => ({ code: 0, stdout: ctags1 + "\n" + ctags2 + "\n", stderr: "" });
+    const executor = async () => ({ code: 0, stdout: ctags1 + "\n" + ctags2 + "\n", stderr: "", killed: false });
     const pi = createMockPi(executor);
     symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -383,7 +383,7 @@ void describe("symbol autocomplete integration", () => {
       let commandCalls = 0;
       const executor = async () => {
         commandCalls++;
-        return { code: 127, stdout: "", stderr: "should not run" };
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
       };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
@@ -441,7 +441,7 @@ void describe("symbol autocomplete integration", () => {
         ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
         ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
       ].join("\n") + "\n";
-      const executor = async () => ({ code: 0, stdout: ctags, stderr: "" });
+      const executor = async () => ({ code: 0, stdout: ctags, stderr: "", killed: false });
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -494,7 +494,7 @@ void describe("symbol autocomplete integration", () => {
         ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
         ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
       ].join("\n") + "\n";
-      const executor = async () => ({ code: 0, stdout: ctags, stderr: "" });
+      const executor = async () => ({ code: 0, stdout: ctags, stderr: "", killed: false });
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 

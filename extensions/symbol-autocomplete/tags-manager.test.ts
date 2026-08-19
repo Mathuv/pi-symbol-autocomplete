@@ -319,7 +319,7 @@ void describe("tags manager ensure()", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  }, { timeout: 5_000 });
+  });
 
   void it("regenerate() queues after an ensure() that finds an existing file", { timeout: 5_000 }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
@@ -355,7 +355,7 @@ void describe("tags manager ensure()", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  }, { timeout: 5_000 });
+  });
 
   void it("keeps an existing file with a tags-file engine when regeneration fails", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
@@ -402,45 +402,79 @@ void describe("tags manager ensure()", () => {
 // ── coordinator serialization ───────────────────────────────────────
 
 void describe("tags manager coordinator", () => {
-  void it("never runs two ctags processes and keeps isBuilding true with three queued requests", { timeout: 5_000 }, async () => {
+  void it("runs a queued ensure's ctags only after a failed regenerate settles", { timeout: 5_000 }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
+      // The first ensure finds an existing file, so it never runs ctags.
       writeSampleTags(tmpDir);
-      const ctagsGate = deferred();
-      const started = deferred();
+      const gates = [deferred(), deferred()];
+      const attemptStarted = [deferred(), deferred()];
+      const events: string[] = [];
       let ctagsRuns = 0;
-      const { executor, tracker } = createMockExecutor({
-        ctagsGate,
-        onCtagsStart: () => started.resolve(),
-        onCtags: (args) => {
+      let activeCtags = 0;
+      let maxActiveCtags = 0;
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          const attempt = ctagsRuns + 1;
           ctagsRuns += 1;
-          writeTagsAt(args);
-        },
-      });
+          events.push(`start${attempt}`);
+          attemptStarted[attempt - 1].resolve();
+          activeCtags += 1;
+          maxActiveCtags = Math.max(maxActiveCtags, activeCtags);
+          try {
+            await gates[attempt - 1].promise;
+            if (attempt === 1) {
+              // The first attempt fails without recreating the tags file.
+              return { code: 1, stdout: "", stderr: "boom", killed: false };
+            }
+            writeTagsAt(args);
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          } finally {
+            events.push(`end${attempt}`);
+            activeCtags -= 1;
+          }
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
 
       const manager = createTagsManager({ cwd: tmpDir, executor });
-      const ensurePromise = manager.ensure(); // finds the existing file, no ctags
-      const regeneratePromise = manager.regenerate(); // runs ctags, gated
+      const ensurePromise = manager.ensure(); // probes and stats only
+      const regeneratePromise = manager.regenerate(); // ctags attempt 1, gated
       await ensurePromise;
-      // A third distinct request queues behind the active regenerate.
-      const thirdPromise = manager.ensure();
 
-      // The regenerate's ctags is in flight and the third request is queued.
-      await started.promise;
+      await attemptStarted[0].promise;
       assert.equal(manager.getStatus().isBuilding, true);
-      assert.equal(tracker.maxActiveCtags, 1);
+      assert.equal(maxActiveCtags, 1);
 
-      ctagsGate.resolve();
+      // Remove the file before the third request executes, so its ensure
+      // must run ctags instead of only stat'ing.
+      fs.rmSync(path.join(tmpDir, "tags"));
+      const thirdPromise = manager.ensure(); // queued behind the regenerate
+
+      // The first attempt fails. The queued ensure's ctags may start only
+      // after the regenerate settled, so attempt 1 must end first.
+      gates[0].resolve();
+      await attemptStarted[1].promise;
+      assert.deepEqual(events, ["start1", "end1", "start2"]);
+      assert.equal(manager.getStatus().isBuilding, true);
+      assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false);
+      assert.equal(maxActiveCtags, 1);
+
+      gates[1].resolve();
       await Promise.all([regeneratePromise, thirdPromise]);
 
-      assert.equal(ctagsRuns, 1);
-      assert.equal(tracker.maxActiveCtags, 1);
+      assert.deepEqual(events, ["start1", "end1", "start2", "end2"]);
+      assert.equal(ctagsRuns, 2);
+      assert.equal(maxActiveCtags, 1);
       assert.equal(manager.getStatus().engine, "generated");
       assert.equal(manager.getStatus().isBuilding, false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  }, { timeout: 5_000 });
+  });
 
   void it("shares one failed ctags attempt across concurrent ensures", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));

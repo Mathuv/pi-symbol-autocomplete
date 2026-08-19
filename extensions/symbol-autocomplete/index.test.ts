@@ -57,7 +57,7 @@ interface MockExtensionAPI extends ExtensionAPI {
   notifyCalls: Array<{ message: string; type: string }>;
 }
 
-function createMockPi(executor: Executor = async () => ({ code: 0, stdout: "", stderr: "" })): MockExtensionAPI {
+function createMockPi(executor: Executor = async () => ({ code: 0, stdout: "", stderr: "", killed: false })): MockExtensionAPI {
   const commands = new Map();
   const handlers = new Map();
   const notifyCalls: Array<{ message: string; type: string }> = [];
@@ -111,7 +111,7 @@ function createMockCtx(overrides?: {
       }),
       addAutocompleteProvider: () => {},
     },
-    exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+    exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
     waitForIdle: async () => {},
     newSession: async () => ({ cancelled: false }),
     fork: async () => ({ cancelled: false }),
@@ -282,7 +282,7 @@ void describe("symbol autocomplete extension", () => {
       const executor: Executor = async (command, args) => {
         execCalls.push({ command, args });
         // Hang until explicitly resolved - simulates a long-running tags build
-        return execPromise.then(() => ({ code: 0, stdout: "", stderr: "" }));
+        return execPromise.then(() => ({ code: 0, stdout: "", stderr: "", killed: false }));
       };
 
       const pi = createMockPi(executor);
@@ -341,11 +341,11 @@ void describe("symbol autocomplete extension", () => {
 
         const exec: Executor = async (command: string, args: string[]) => {
           if (command === "readtags") {
-            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "" };
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
           }
           if (command === "ctags") {
             if (ctagsFails) {
-              return { code: 1, stdout: "", stderr: "timeout" };
+              return { code: 1, stdout: "", stderr: "timeout", killed: false };
             }
             // A successful ctags run writes the tags file
             const fIndex = args.indexOf("-f");
@@ -353,9 +353,9 @@ void describe("symbol autocomplete extension", () => {
               args[fIndex + 1],
               "MyClass\tsrc/my-class.ts\t/^class MyClass$/;\"\tc\tline:10\n",
             );
-            return { code: 0, stdout: "", stderr: "" };
+            return { code: 0, stdout: "", stderr: "", killed: false };
           }
-          return { code: 0, stdout: "", stderr: "" };
+          return { code: 0, stdout: "", stderr: "", killed: false };
         };
 
         const pi = createMockPi(exec);
