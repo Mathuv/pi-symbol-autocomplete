@@ -870,3 +870,115 @@ void describe("tags manager shutdown()", () => {
     }
   });
 });
+
+// ── temp-file cleanup failures ──────────────────────────────────────
+
+void describe("tags manager cleanup failures", () => {
+  void it("rejects the operation and shutdown when the temp file cannot be removed", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean-"));
+    try {
+      // The fake ctags writes the temp file, then locks the directory so
+      // the manager's rename and cleanup unlink fail with EACCES. The
+      // read-only mode is platform-sensitive; tests run as a non-root user.
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          fs.chmodSync(tmpDir, 0o555);
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await assert.rejects(manager.ensure(), /failed to remove temporary tags file/);
+
+      const status = manager.getStatus();
+      assert.equal(status.engine, "none");
+      assert.match(status.lastError ?? "", /failed to remove temporary tags file .*\.tags\.tmp-/);
+      assert.equal(status.isBuilding, false);
+      assert.ok(
+        fs.readdirSync(tmpDir).some((name) => name.startsWith(".tags.tmp-")),
+        "the failed cleanup must leave the temp file in place",
+      );
+
+      // Shutdown rejects after the queue settles. Repeated calls return
+      // the same rejected promise instead of a successful cleanup.
+      fs.chmodSync(tmpDir, 0o755);
+      const shutdownPromise = manager.shutdown();
+      assert.equal(manager.shutdown(), shutdownPromise);
+      await assert.rejects(shutdownPromise, /failed to remove temporary tags file/);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("keeps the live tags file when cleanup fails during a regenerate", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean2-"));
+    try {
+      writeSampleTags(tmpDir);
+      const original = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          fs.chmodSync(tmpDir, 0o555);
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await assert.rejects(manager.regenerate(), /failed to remove temporary tags file/);
+
+      assert.equal(
+        fs.readFileSync(path.join(tmpDir, "tags"), "utf8"),
+        original,
+        "a cleanup failure must never replace or delete the live file",
+      );
+      assert.match(manager.getStatus().lastError ?? "", /failed to remove temporary tags file .*\.tags\.tmp-/);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("runs a later request after a rejected cleanup failure", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-clean3-"));
+    try {
+      // Only the first ctags run locks the directory. The later request
+      // must prove the queue does not stick after a rejection.
+      let locked = false;
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          writeTagsAt(args);
+          if (!locked) {
+            locked = true;
+            fs.chmodSync(tmpDir, 0o555);
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await assert.rejects(manager.ensure(), /failed to remove temporary tags file/);
+
+      fs.chmodSync(tmpDir, 0o755);
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});

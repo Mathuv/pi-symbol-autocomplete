@@ -5,9 +5,13 @@
  * It reads stdout line by line and never buffers the full output.
  * Memory use is constant per query.
  *
- * Each query enforces four bounds. The first bound reached kills the child:
- * - result cap (caller-provided, at most 50 results),
+ * Autocomplete prefix and dotted queries cap results at 50. Exact resolver
+ * scans intentionally stream every exact match and use scanned-line,
+ * per-line byte, total-time, and abort bounds instead of a result cap.
+ * The first bound reached kills the child:
+ * - result cap (autocomplete queries only, at most 50 results),
  * - scanned-line cap (10 000 lines),
+ * - per-line byte cap (64 KiB),
  * - timeout (5 s),
  * - abort via an AbortSignal.
  */
@@ -473,11 +477,24 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         state.waiters -= 1;
-        // Abort the shared subprocess only when the final waiter leaves
-        // before the load settles, so no orphan process survives.
-        if (state.waiters === 0 && !state.done) state.controller.abort();
-        if (outcome.kind === "error") reject(outcome.error);
-        else resolve(outcome);
+        if (outcome.kind === "error") {
+          reject(outcome.error);
+          return;
+        }
+        // A caller that leaves (abort or deadline) and is the final waiter
+        // before the load settles aborts the shared subprocess and awaits
+        // its settlement. No alias child survives the final caller's
+        // resolution, even a SIGTERM-ignoring child that needs the
+        // SIGKILL grace. Non-final leaves stay immediate.
+        if (outcome.kind === "left" && state.waiters === 0 && !state.done) {
+          state.controller.abort();
+          state.promise.then(
+            () => resolve(outcome),
+            () => resolve(outcome),
+          );
+          return;
+        }
+        resolve(outcome);
       };
       const onAbort = () => finish({ kind: "left" });
       const timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));

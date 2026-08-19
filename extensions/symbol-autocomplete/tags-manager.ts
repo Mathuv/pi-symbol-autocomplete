@@ -35,6 +35,13 @@ const CTAGS_NOT_FOUND = "ctags not found — install universal-ctags";
 const CTAGS_HINT = "ctags failed — install universal-ctags";
 const PROBE_TIMEOUT_MS = 5_000;
 
+/** Return the Node error code (e.g. "ENOENT") for an error, or "". */
+function errorCode(err: unknown): string {
+  return typeof err === "object" && err !== null && "code" in err
+    ? String((err as { code?: unknown }).code)
+    : "";
+}
+
 /** Build the ctags exclude flags from DEFAULT_EXCLUDES and extraExcludes. */
 function buildExcludeArgs(extraExcludes?: string[]): string[] {
   const patterns = [...DEFAULT_EXCLUDES, ...(extraExcludes ?? [])];
@@ -87,6 +94,8 @@ export function createTagsManager(options: {
   // Number of distinct queued and active requests. isBuilding stays true
   // until this is 0. Coalesced callers do not increment it.
   let pendingDistinct = 0;
+  // First operation failure, surfaced by shutdown().
+  let operationFailure: unknown = null;
   // Monotonic ctags attempt counter. Incremented before every ctags
   // executor call. A request whose observed count is stale at execution
   // time joins the intervening attempt.
@@ -206,7 +215,17 @@ export function createTagsManager(options: {
     } finally {
       // Never leave a partial temp file behind. ENOENT means the rename
       // already moved it; the live file is never replaced on failure.
-      await unlink(tempTagsPath).catch(() => {});
+      // Any other cleanup error rejects the operation with the temp path
+      // so shutdown can surface it instead of a successful cleanup.
+      try {
+        await unlink(tempTagsPath);
+      } catch (err: unknown) {
+        if (errorCode(err) !== "ENOENT") {
+          throw new Error(
+            `failed to remove temporary tags file ${tempTagsPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
     }
   }
 
@@ -237,6 +256,8 @@ export function createTagsManager(options: {
       await runCtags();
     } catch (err: unknown) {
       status = { ...status, engine: "none", lastError: err instanceof Error ? err.message : String(err) };
+      // A failed temporary-file cleanup must reject the operation.
+      throw err;
     }
   }
 
@@ -256,6 +277,8 @@ export function createTagsManager(options: {
       await runCtags();
     } catch (err: unknown) {
       status = { ...status, engine: "none", lastError: err instanceof Error ? err.message : String(err) };
+      // A failed temporary-file cleanup must reject the operation.
+      throw err;
     }
   }
 
@@ -274,9 +297,23 @@ export function createTagsManager(options: {
     status = { ...status, isBuilding: true };
     const observedAttempt = ctagsAttemptId;
     const run = kind === "ensure" ? () => runEnsure(observedAttempt) : () => runRegenerate(observedAttempt);
-    // The settled chain cannot reject, so a failure never poisons the tail.
-    const request = tail.then(run, run).then(finish, finish);
-    tail = request;
+    // The settled tail cannot reject, so a failure never poisons the queue.
+    // The request rejects so callers and shutdown see the failure.
+    const request = tail.then(run, run).then(
+      (value) => {
+        finish();
+        return value;
+      },
+      (error: unknown) => {
+        finish();
+        operationFailure ??= error;
+        throw error;
+      },
+    );
+    tail = request.then(
+      () => undefined,
+      () => undefined,
+    );
     if (kind === "ensure") ensureRequest = request;
     else regenerateRequest = request;
     return request;
@@ -312,7 +349,11 @@ export function createTagsManager(options: {
     // this point returns immediately and never appends to the tail.
     obsolete = true;
     lifetimeController.abort();
-    shutdownPromise = tail;
+    shutdownPromise = tail.then(() => {
+      // A failed temporary-file cleanup rejects shutdown after the queue
+      // settles, instead of reporting a successful cleanup.
+      if (operationFailure !== null) throw operationFailure;
+    });
     return shutdownPromise;
   }
 

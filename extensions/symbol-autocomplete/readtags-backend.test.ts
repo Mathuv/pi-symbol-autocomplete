@@ -193,6 +193,18 @@ if (alias) {
       }
       setTimeout(poll, 5);
     })();
+  } else if (mode === "stubborn-alias") {
+    fs.appendFileSync(marker, "P" + process.pid + "\\n");
+    process.removeAllListeners("SIGTERM");
+    process.on("SIGTERM", () => {});
+    const gate = marker + "-go";
+    (function poll() {
+      if (fs.existsSync(gate)) {
+        process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc,class\\n");
+        process.exit(0);
+      }
+      setTimeout(poll, 5);
+    })();
   } else if (mode === "alias-cap") {
     for (let index = 0; index <= 1_000; index += 1) {
       process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc" + index + ",class\\n");
@@ -503,6 +515,34 @@ void describe("readtags backend bounds", () => {
       assert.throws(
         () => process.kill(pid, 0),
         "the shared child must be dead after the last caller aborts",
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("settles the final aborted caller only after the SIGTERM-ignoring alias child is dead", async () => {
+    // P2: a final waiter's abort must not resolve before the shared alias
+    // child is dead. A SIGTERM-ignoring child needs the SIGKILL grace, so
+    // the caller waits for the close instead of settling early.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("stubborn-alias");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const controller = new AbortController();
+
+      const started = Date.now();
+      const query = backend.queryPrefix("aliased", 50, controller.signal);
+      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
+      controller.abort();
+      assert.deepEqual(await query, []);
+
+      // The caller settled only after the SIGKILL grace. The pid must
+      // already be gone; do not poll after the caller settled.
+      assert.ok(Date.now() - started >= 150, `SIGKILL grace must elapse before settlement (took ${Date.now() - started} ms)`);
+      const pid = Number.parseInt(readMarker(markerPath).match(/P(\d+)/)![1], 10);
+      assert.throws(
+        () => process.kill(pid, 0),
+        "the alias child must be dead when the final caller settles",
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
