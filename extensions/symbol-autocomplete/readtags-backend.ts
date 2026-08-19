@@ -209,8 +209,10 @@ export function parseTagLine(line: string, aliases: Map<string, string>): Projec
  * Stream `readtags` stdout line by line into `onLine`.
  * The callback returns false to stop; the child is killed on stop.
  * The timeout and the AbortSignal also kill the child.
- * The promise resolves true only when the stream ends normally.
+ * The promise reports whether the stream completed, hit a callback cap, or stopped early.
  */
+type StreamResult = "complete" | "capped" | "interrupted";
+
 function streamReadtags(
   command: string,
   args: string[],
@@ -218,10 +220,10 @@ function streamReadtags(
   signal: AbortSignal | undefined,
   deadline: number,
   onLine: (line: string) => boolean,
-): Promise<boolean> {
+): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted || Date.now() >= deadline) {
-      resolve(false);
+      resolve("interrupted");
       return;
     }
 
@@ -234,24 +236,25 @@ function streamReadtags(
     }
 
     let finished = false;
-    let stopped = false;
+    let result: StreamResult = "complete";
     let pendingBytes = 0;
     let timer: NodeJS.Timeout | undefined;
     let lines: ReturnType<typeof createInterface>;
+    let abort: () => void;
 
     const settle = (error?: Error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      signal?.removeEventListener("abort", stop);
+      signal?.removeEventListener("abort", abort);
       lines.close();
       if (error) reject(error);
-      else resolve(!stopped);
+      else resolve(result);
     };
 
-    const stop = () => {
+    const stop = (nextResult: Exclude<StreamResult, "complete">) => {
       if (finished) return;
-      stopped = true;
+      result = nextResult;
       child.kill();
       settle();
     };
@@ -263,7 +266,7 @@ function streamReadtags(
           if (chunk[index] !== 0x0a) continue;
           const lineBytes = pendingBytes + index - start;
           if (lineBytes > MAX_LINE_BYTES) {
-            stop();
+            stop("interrupted");
             callback();
             return;
           }
@@ -276,7 +279,7 @@ function streamReadtags(
         if (pendingBytes + tailBytes > MAX_LINE_BYTES) {
           const allowed = MAX_LINE_BYTES - pendingBytes;
           if (allowed > 0) this.push(chunk.subarray(start, start + allowed));
-          stop();
+          stop("interrupted");
           callback();
           return;
         }
@@ -287,15 +290,16 @@ function streamReadtags(
     });
     lines = createInterface({ input: child.stdout.pipe(byteCap) });
 
-    signal?.addEventListener("abort", stop, { once: true });
-    timer = setTimeout(stop, Math.max(0, deadline - Date.now()));
+    abort = () => stop("interrupted");
+    signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
     child.on("error", (error) => settle(error));
     child.on("close", (code) => {
-      if (stopped || code === 0) settle();
+      if (result !== "complete" || code === 0) settle();
       else settle(new Error(`readtags exited with code ${code ?? "signal"}`));
     });
     lines.on("line", (line) => {
-      if (!finished && !onLine(line)) stop();
+      if (!finished && !onLine(line)) stop("capped");
     });
   });
 }
@@ -309,14 +313,14 @@ async function loadKindAliases(
   deadline: number,
 ): Promise<{ aliases: Map<string, string>; complete: boolean }> {
   const aliases = new Map<string, string>();
-  const complete = await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
+  const result = await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
     if (line.startsWith(TAG_KIND_DESCRIPTION_PREFIX)) {
       parseKindAlias(line, aliases);
       if (aliases.size >= MAX_KIND_ALIASES) return false;
     }
     return true;
   });
-  return { aliases, complete };
+  return { aliases, complete: result !== "interrupted" };
 }
 
 /**

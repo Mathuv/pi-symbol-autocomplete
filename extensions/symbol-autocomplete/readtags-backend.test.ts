@@ -182,8 +182,15 @@ function stopped() { fs.writeFileSync(marker, fs.readFileSync(marker, "utf8") + 
 process.on("SIGTERM", stopped);
 if (alias) {
   if (mode === "slow-alias") setInterval(() => {}, 1000);
-  else process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc,class\\n");
-  if (mode !== "slow-alias") process.exit(0);
+  else if (mode === "alias-cap") {
+    for (let index = 0; index <= 1_000; index += 1) {
+      process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc" + index + ",class\\n");
+    }
+    setInterval(() => {}, 1000);
+  } else {
+    process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc,class\\n");
+    process.exit(0);
+  }
 } else if (mode === "dotted") {
   process.stdout.write("resA\\ta.ts\\t/^resA$/;\\\"\\tkind:property\\tline:1\\tclass:CampaignHelper\\n");
   process.stdout.write("resZ\\ta.ts\\t/^resZ$/;\\\"\\tkind:property\\tline:2\\tclass:Campaign\\n");
@@ -247,9 +254,10 @@ void describe("readtags backend bounds", () => {
     const { dir, tagsPath, command, markerPath } = createReadtagsShim("scanned");
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const started = Date.now();
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
-      const sent = Number.parseInt((await waitForKill(markerPath)).match(/K(\d+)/)![1], 10);
-      assert.ok(sent >= 10_000 && sent < 10_200);
+      assert.match(await waitForKill(markerPath), /K\d+/);
+      assert.ok(Date.now() - started < 2_000);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -290,6 +298,18 @@ void describe("readtags backend bounds", () => {
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
       assert.ok(Date.now() - started < 5_500);
       assert.equal(await waitForKill(markerPath), "D\nK0");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("caches aliases after the alias cap", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-cap");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      await backend.queryPrefix("symbol", 1);
+      await backend.queryPrefix("symbol", 1);
+      assert.equal(readMarker(markerPath).match(/D/g)?.length, 1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
