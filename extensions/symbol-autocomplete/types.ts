@@ -79,8 +79,12 @@ export interface ReadtagsBackend {
    */
   queryDotted(parentQuery: string, memberQuery: string, limit: number, signal?: AbortSignal): Promise<ProjectSymbol[]>;
 
-  /** Look up symbols by exact name. Results are capped at `limit` (at most 50). */
-  lookupExact(name: string, limit?: number): Promise<ProjectSymbol[]>;
+  /**
+   * Stream every symbol with the exact name `name` through `onSymbol`.
+   * The scan runs to normal EOF or rejects as incomplete. It never
+   * accumulates symbols in the backend.
+   */
+  scanExact(name: string, onSymbol: (symbol: ProjectSymbol) => void): Promise<void>;
 }
 
 /** Default directory exclude patterns. */

@@ -68,9 +68,7 @@ function createMockBackend(overrides?: {
       calls.push({ method: "queryDotted", args: [parent, member, limit, signal] });
       return overrides?.dotted ? overrides.dotted(parent, member, limit, signal) : [];
     },
-    async lookupExact() {
-      return [];
-    },
+    async scanExact() {},
   };
   return Object.assign(backend, { calls });
 }

@@ -100,7 +100,10 @@ function createMockPi(executor: Executor = async () => ({ code: 0, stdout: "", s
 
 function createMockCtx(overrides?: {
   cwd?: string;
-  ui?: { notify?: (message: string, type: string) => void };
+  ui?: {
+    notify?: (message: string, type: string) => void;
+    addAutocompleteProvider?: (factory: (current: unknown) => unknown) => void;
+  };
 }): ExtensionCommandContext {
   const notifyCalls: Array<{ message: string; type: string }> = [];
   const ctx = {
@@ -109,7 +112,7 @@ function createMockCtx(overrides?: {
       notify: overrides?.ui?.notify ?? ((message: string, type: string) => {
         notifyCalls.push({ message, type });
       }),
-      addAutocompleteProvider: () => {},
+      addAutocompleteProvider: overrides?.ui?.addAutocompleteProvider ?? (() => {}),
     },
     exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
     waitForIdle: async () => {},
@@ -254,6 +257,9 @@ void describe("symbol autocomplete extension", () => {
       assert.match(msg, /Modified: /);
       assert.match(msg, /In flight: false/);
       assert.match(msg, /Last error: /);
+      // P2: the report must not contain any symbol count field or text.
+      assert.ok(!/\bsymbol/i.test(msg), "status must not mention symbols");
+      assert.ok(!/\bcount\b/i.test(msg), "status must not mention a count");
     });
 
     void it("reports not initialized when manager is null", async () => {
@@ -483,7 +489,7 @@ void describe("symbol autocomplete extension", () => {
         const createBackend = () => ({
           queryPrefix: async () => [],
           queryDotted: async () => [],
-          lookupExact: async () => {
+          scanExact: async () => {
             throw new Error("readtags exploded");
           },
         });
@@ -559,17 +565,21 @@ void describe("symbol autocomplete extension", () => {
 
         const pi = createMockPi(executor);
 
-        // Track every backend instance and which one served the turn.
-        const backends: Array<{ tagsFilePath: string; cwd: string; lookups: string[] }> = [];
+        // Track every backend instance and which one served queries and scans.
+        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[]; scans: string[] }> = [];
+        const providerFactories: Array<(current: unknown) => unknown> = [];
         const createBackend = (tagsFilePath: string, cwd: string) => {
-          const record = { tagsFilePath, cwd, lookups: [] as string[] };
+          const record = { tagsFilePath, cwd, queries: [] as string[], scans: [] as string[] };
           backends.push(record);
           return {
-            queryPrefix: async () => [],
+            queryPrefix: async (query: string) => {
+              record.queries.push(query);
+              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
+            },
             queryDotted: async () => [],
-            lookupExact: async (name: string) => {
-              record.lookups.push(name);
-              return [{ name, kind: "class", path: "service.ts", line: 1 }];
+            scanExact: async (name: string, onSymbol: (symbol: { name: string; kind: string; path: string; line: number }) => void) => {
+              record.scans.push(name);
+              onSymbol({ name, kind: "class", path: "service.ts", line: 1 });
             },
           };
         };
@@ -585,15 +595,50 @@ void describe("symbol autocomplete extension", () => {
         assert.ok(beforeAgentStartHandler);
 
         // Start session A, then a second session in a different cwd.
-        sessionStartHandler?.({}, createMockCtx({ cwd: dirA }));
+        const makeSessionCtx = (cwd: string) =>
+          createMockCtx({
+            cwd,
+            ui: {
+              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
+                providerFactories.push(factory);
+              },
+            },
+          });
+        sessionStartHandler?.({}, makeSessionCtx(dirA));
         await new Promise((r) => setTimeout(r, 50));
-        sessionStartHandler?.({}, createMockCtx({ cwd: dirB }));
+        sessionStartHandler?.({}, makeSessionCtx(dirB));
         await new Promise((r) => setTimeout(r, 50));
 
         assert.equal(backends.length, 2, "one backend per session");
         assert.equal(backends[0].cwd, dirA);
         assert.equal(backends[1].cwd, dirB);
         assert.equal(backends[1].tagsFilePath, path.join(dirB, "tags"));
+        assert.equal(providerFactories.length, 2, "one autocomplete provider per session");
+
+        // P2: the provider registered for the second session must query the
+        // second session's backend, never the first session's.
+        const provider = providerFactories[1]({
+          async getSuggestions() {
+            return null;
+          },
+          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
+            const line = lines[cursorLine] ?? "";
+            const start = cursorCol - prefix.length;
+            const nextLines = [...lines];
+            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
+            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+          },
+          shouldTriggerFileCompletion() {
+            return true;
+          },
+        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
+        const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
+          signal: AbortSignal.timeout(1000),
+        });
+        assert.ok(suggestions, "second-session provider must return suggestions");
+        assert.equal(suggestions.prefix, "#MySer");
+        assert.deepEqual(backends[0].queries, [], "provider must not query the session A backend");
+        assert.deepEqual(backends[1].queries, ["MySer"], "provider must query the session B backend");
 
         // Write the file the mock symbol path points at, so injection succeeds.
         fs.writeFileSync(path.join(dirB, "service.ts"), "class MyService {}\n");
@@ -611,8 +656,8 @@ void describe("symbol autocomplete extension", () => {
 
         // The turn must resolve through the backend of the current session.
         assert.ok(result !== undefined, "should inject via the current backend");
-        assert.deepEqual(backends[0].lookups, [], "no lookup on the stale session A backend");
-        assert.deepEqual(backends[1].lookups, ["MyService"]);
+        assert.deepEqual(backends[0].scans, [], "no scan on the stale session A backend");
+        assert.deepEqual(backends[1].scans, ["MyService"]);
 
         // Command handlers must use the current session's manager.
         const rescanHandler = pi.commands.get("rescan-symbols") as

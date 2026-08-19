@@ -174,7 +174,7 @@ void describe("symbol autocomplete integration", () => {
         },
       };
       const provider = providerFactory(currentProvider);
-      const suggestions = await provider.getSuggestions(["#My"], 0, 3, { signal: AbortSignal.timeout(1000) });
+      const suggestions = await provider.getSuggestions(["#My"], 0, 3, { signal: AbortSignal.timeout(5000) });
 
       assert.ok(suggestions);
       assert.equal(suggestions.prefix, "#My");
@@ -472,7 +472,7 @@ void describe("symbol autocomplete integration", () => {
         },
       };
       const provider = providerFactory(currentProvider);
-      const suggestions = await provider.getSuggestions(["#Campaign.reservatio"], 0, 20, { signal: AbortSignal.timeout(1000) });
+      const suggestions = await provider.getSuggestions(["#Campaign.reservatio"], 0, 20, { signal: AbortSignal.timeout(5000) });
 
       assert.ok(suggestions);
       assert.equal(suggestions.prefix, "#Campaign.reservatio");

@@ -8,12 +8,17 @@
  * - Plain token parsing (#name)
  * - Resolver stable token chain (exact path+line → same-name same-file → unresolved)
  * - Resolver plain token rules (unique → resolved, ambiguous → skip)
- * - Resolver lookup deduplication (one lookup per distinct name)
+ * - Resolver scan deduplication (one scan per distinct name)
+ * - Bounded per-reference candidate state with real readtags fixtures (>50 matches)
  * - Diagnostic metadata on all resolution outcomes
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type {
   ProjectSymbol,
   ParseResult,
@@ -22,6 +27,7 @@ import type {
 } from "./types.ts";
 import { parsePrompt } from "./reference-parser.ts";
 import { resolveReferences } from "./resolver.ts";
+import { createReadtagsBackend } from "./readtags-backend.ts";
 
 // ── Sample symbols for resolver tests ───────────────────────────────
 
@@ -39,23 +45,58 @@ const SYMBOLS: ProjectSymbol[] = [
 // ── Mock backend ────────────────────────────────────────────────────
 
 /**
- * Create a mock backend whose lookupExact returns the exact-name matches
- * from `symbols`. Records every lookup name for dedup assertions.
+ * Create a mock backend whose scanExact streams the exact-name matches
+ * from `symbols`. Records every scanned name for dedup assertions.
  */
 function createMockBackend(symbols: ProjectSymbol[]): {
   backend: ReadtagsBackend;
-  lookupCalls: string[];
+  scanCalls: string[];
 } {
-  const lookupCalls: string[] = [];
+  const scanCalls: string[] = [];
   const backend: ReadtagsBackend = {
     queryPrefix: async () => [],
     queryDotted: async () => [],
-    lookupExact: async (name: string) => {
-      lookupCalls.push(name);
-      return symbols.filter((s) => s.name === name);
+    scanExact: async (name: string, onSymbol) => {
+      scanCalls.push(name);
+      for (const symbol of symbols) {
+        if (symbol.name === name) onSymbol(symbol);
+      }
     },
   };
-  return { backend, lookupCalls };
+  return { backend, scanCalls };
+}
+
+// ── Real readtags fixtures (P1: >50 identical tag names) ─────────────
+
+const readtagsPresent = spawnSync("readtags", ["--version"]).status === 0;
+const SKIP_NO_READTAGS = readtagsPresent ? false : "readtags binary not available";
+
+/** Write a classic-format tags file and return its path. */
+function writeTagsFile(dir: string, lines: string[]): string {
+  const tagsPath = path.join(dir, "tags");
+  fs.writeFileSync(
+    tagsPath,
+    [
+      "!_TAG_FILE_FORMAT\t2\t/extended format/",
+      "!_TAG_FILE_SORTED\t2\t/0=unsorted, 1=sorted, 2=foldcase/",
+      ...lines,
+    ].join("\n") + "\n",
+  );
+  return tagsPath;
+}
+
+/** Build one classic-format definition line. */
+function classicTagLine(name: string, filePath: string, kind: string, line: number, scope?: string): string {
+  const parts = [
+    name,
+    filePath,
+    `/^${kind} ${name}/;"`,
+    `kind:${kind}`,
+    `line:${line}`,
+    "language:TypeScript",
+  ];
+  if (scope) parts.push(`scope:${scope}`);
+  return parts.join("\t");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -550,30 +591,72 @@ void describe("resolver", () => {
     );
   });
 
-  // ── Lookup deduplication ────────────────────────────────────────
+  // ── Scan deduplication ────────────────────────────────────────
 
-  void it("looks up a repeated name only once per resolve call", async () => {
-    // Plain and stable references to the same name share one lookup.
+  void it("scans a repeated name only once per resolve call", async () => {
+    // Plain and stable references to the same name share one scan.
     const parsed = parsePrompt(
       "#MyService\n#MyService@src/services/my-service.ts:10\n#MyService@src/deprecated/my-service.ts:3",
     );
-    const { backend, lookupCalls } = createMockBackend(SYMBOLS);
+    const { backend, scanCalls } = createMockBackend(SYMBOLS);
     const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 3);
     assert.equal(
-      lookupCalls.filter((n) => n === "MyService").length,
+      scanCalls.filter((n) => n === "MyService").length,
       1,
-      "repeated references must share one lookup",
+      "repeated references must share one scan",
     );
   });
 
-  void it("looks up each distinct name exactly once", async () => {
+  void it("scans each distinct name exactly once", async () => {
     const parsed = parsePrompt("#Database\n#Helper");
-    const { backend, lookupCalls } = createMockBackend(SYMBOLS);
+    const { backend, scanCalls } = createMockBackend(SYMBOLS);
     await resolveReferences(parsed.references, backend);
 
-    assert.deepEqual(lookupCalls.sort(), ["Database", "Helper"]);
+    assert.deepEqual(scanCalls.sort(), ["Database", "Helper"]);
+  });
+
+  void it("shares one scan across plain, stable, and dotted refs with the same key", async () => {
+    // P2: plain/stable refs on name "seed" and a dotted ref whose member
+    // name is "seed" must trigger exactly one scanExact call.
+    const SEED_SYMBOLS: ProjectSymbol[] = [
+      ...SYMBOLS,
+      { name: "seed", kind: "function", path: "src/seed.ts", line: 1 },
+      { name: "seed", kind: "function", path: "src/seed.ts", line: 60 },
+      { name: "seed", kind: "property", parentName: "Campaign", path: "src/models/campaign.ts", line: 5 },
+    ];
+    const parsed = parsePrompt(
+      "#seed\n#seed@src/seed.ts:60\n#Campaign.seed",
+    );
+    const { backend, scanCalls } = createMockBackend(SEED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
+
+    assert.equal(result.resolved.length, 3);
+    assert.equal(scanCalls.length, 1, "one distinct key must use exactly one scan");
+    assert.equal(scanCalls[0], "seed");
+
+    // The dotted ref filters by parent within the same shared stream.
+    const dotted = result.resolved.find((r) => r.parsed.name === "Campaign.seed");
+    assert.equal(dotted?.status, "resolved");
+    assert.equal(dotted?.symbol?.parentName, "Campaign");
+  });
+
+  void it("rejects when a backend scan rejects", async () => {
+    // P2: an incomplete scan must reject resolveReferences, never return
+    // partial results as complete.
+    const backend: ReadtagsBackend = {
+      queryPrefix: async () => [],
+      queryDotted: async () => [],
+      scanExact: async () => {
+        throw new Error("exact scan did not complete (capped)");
+      },
+    };
+    const parsed = parsePrompt("#Database");
+    await assert.rejects(
+      resolveReferences(parsed.references, backend),
+      /did not complete/,
+    );
   });
 
   // ── Edge cases ──────────────────────────────────────────────────
@@ -928,16 +1011,16 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.line, 42);
   });
 
-  void it("does not look up multi-dot names", async () => {
+  void it("does not scan multi-dot names", async () => {
     // Multi-dot chains are unsupported: they must not reach the backend.
     const parsed = parsePrompt("#A.B.C\n#Namespace.Campaign.reservation_date");
-    const { backend, lookupCalls } = createMockBackend(DOTTED_SYMBOLS);
+    const { backend, scanCalls } = createMockBackend(DOTTED_SYMBOLS);
     const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 2);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[1].status, "unresolved");
-    assert.equal(lookupCalls.length, 0, "multi-dot names must not trigger lookups");
+    assert.equal(scanCalls.length, 0, "multi-dot names must not trigger scans");
   });
 
   // ── Multi-dot regression tests: literal dotted symbol ───────────
@@ -1006,5 +1089,107 @@ void describe("dotted resolver", () => {
     assert.equal(r.status, "resolved");
     assert.equal(r.symbol?.name, "reservation_date");
     assert.equal(r.symbol?.parentName, "Campaign");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// P1 REGRESSION: >50 identical tag names with the real readtags binary
+// ═══════════════════════════════════════════════════════════════════════
+
+void describe("resolver with >50 same-name records (real readtags)", { skip: SKIP_NO_READTAGS }, () => {
+  const SEED_COUNT = 60;
+
+  /** 60 `seed` records at src/seed.ts lines 1..60, plus dotted records. */
+  function buildSeedFixture(dir: string): { tagsPath: string } {
+    const lines: string[] = [];
+    for (let i = 1; i <= SEED_COUNT; i += 1) {
+      lines.push(classicTagLine("seed", "src/seed.ts", "function", i));
+    }
+    for (let i = 1; i <= SEED_COUNT; i += 1) {
+      lines.push(classicTagLine("reservation_date", "src/models/campaign.ts", "property", i, "class:Campaign"));
+    }
+    return { tagsPath: writeTagsFile(dir, lines) };
+  }
+
+  void it("resolves a stable token whose exact target is record 51+", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-p1-seed-"));
+    try {
+      const { tagsPath } = buildSeedFixture(dir);
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
+
+      // Precondition: the target (line 60) is the last of 60 records, so
+      // a capped lookup that keeps only 50 would miss it.
+      const raw = spawnSync("readtags", ["-t", tagsPath, "-e", "-n", "-", "seed"]);
+      assert.equal(raw.status, 0);
+      const records = raw.stdout.toString().split("\n").filter((l) => l);
+      assert.equal(records.length, SEED_COUNT);
+      const targetIndex = records.findIndex((l) => l.includes("line:60"));
+      assert.ok(targetIndex >= 50, `target must be record 51+ (got index ${targetIndex})`);
+
+      const parsed = parsePrompt("#seed@src/seed.ts:60");
+      const result = await resolveReferences(parsed.references, backend);
+
+      assert.equal(result.resolved.length, 1);
+      const r = result.resolved[0];
+      assert.equal(r.status, "resolved");
+      assert.equal(r.symbol?.name, "seed");
+      assert.equal(r.symbol?.path, "src/seed.ts");
+      assert.equal(r.symbol?.line, 60);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("prefers a later exact line over an earlier same-file stale candidate", async () => {
+    // Records 1..59 are same-file, non-exact (stale) candidates that arrive
+    // before the exact record at line 60. The resolver must pick the exact
+    // record, not the first stale fallback.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-p1-stale-"));
+    try {
+      const { tagsPath } = buildSeedFixture(dir);
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
+
+      const parsed = parsePrompt("#seed@src/seed.ts:60");
+      const result = await resolveReferences(parsed.references, backend);
+
+      assert.equal(result.resolved.length, 1);
+      const r = result.resolved[0];
+      assert.equal(r.status, "resolved", "exact match must beat the stale fallback");
+      assert.equal(r.symbol?.line, 60);
+      assert.ok(result.injectable.some((i) => i.parsed.name === "seed"));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("still detects plain and dotted ambiguity after 50 records", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-p1-ambig-"));
+    try {
+      const { tagsPath } = buildSeedFixture(dir);
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
+
+      // Plain: 60 records named "seed" → ambiguous.
+      const plain = await resolveReferences(parsePrompt("#seed").references, backend);
+      assert.equal(plain.resolved[0].status, "ambiguous");
+      assert.equal(plain.resolved[0].symbol, null);
+      assert.ok(
+        plain.resolved[0].message.includes("multiple"),
+        "ambiguous diagnostic must say multiple matches",
+      );
+      assert.equal(plain.injectable.length, 0);
+
+      // Dotted plain: 60 records with parent Campaign and member
+      // reservation_date → ambiguous.
+      const dotted = await resolveReferences(
+        parsePrompt("#Campaign.reservation_date").references,
+        backend,
+      );
+      assert.equal(dotted.resolved[0].status, "ambiguous");
+      assert.equal(dotted.resolved[0].symbol, null);
+      assert.ok(dotted.resolved[0].message.includes("multiple"));
+      assert.equal(dotted.injectable.length, 0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { createReadtagsBackend, parseTagLine } from "./readtags-backend.ts";
+import type { ProjectSymbol } from "./types.ts";
 
 // ── parseTagLine unit tests ─────────────────────────────────────────
 
@@ -378,7 +379,8 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
     const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.lookupExact("Campaign");
+      const symbols: ProjectSymbol[] = [];
+      await backend.scanExact("Campaign", (symbol) => symbols.push(symbol));
 
       assert.equal(symbols.length, 1);
       assert.ok(symbols[0].endLine !== undefined);
@@ -447,11 +449,12 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
     }
   });
 
-  void it("looks up an exact name", async () => {
+  void it("streams an exact name", async () => {
     const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.lookupExact("Campaign");
+      const symbols: ProjectSymbol[] = [];
+      await backend.scanExact("Campaign", (symbol) => symbols.push(symbol));
 
       assert.equal(symbols.length, 1);
       assert.equal(symbols[0].name, "Campaign");
@@ -463,12 +466,75 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
     }
   });
 
-  void it("returns an empty array for an unknown exact name", async () => {
+  void it("visits nothing for an unknown exact name", async () => {
     const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.lookupExact("NoSuchSymbol");
+      const symbols: ProjectSymbol[] = [];
+      await backend.scanExact("NoSuchSymbol", (symbol) => symbols.push(symbol));
       assert.deepEqual(symbols, []);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("streams more than 50 exact records through the visitor", { skip: !readtagsPresent }, async () => {
+    // P1: the backend must not cap exact scans at 50 results. A fixture
+    // with 60 identical names must deliver all 60 to the visitor while
+    // the backend itself retains none.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rt-scan-60-"));
+    const tagsPath = path.join(dir, "tags");
+    const lines = [
+      "!_TAG_FILE_FORMAT\t2\t/extended format/",
+      "!_TAG_FILE_SORTED\t2\t/0=unsorted, 1=sorted, 2=foldcase/",
+    ];
+    for (let i = 1; i <= 60; i += 1) {
+      lines.push(`seed\tsrc/seed.ts\t/^def seed():$/;"\tkind:function\tline:${i}\tlanguage:TypeScript`);
+    }
+    fs.writeFileSync(tagsPath, lines.join("\n") + "\n");
+
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
+      const seen: ProjectSymbol[] = [];
+      await backend.scanExact("seed", (symbol) => seen.push(symbol));
+
+      assert.equal(seen.length, 60);
+      assert.ok(seen.every((s) => s.name === "seed"));
+      assert.equal(new Set(seen.map((s) => s.line)).size, 60);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("rejects an exact scan that hits the scanned-line cap", async () => {
+    // P1: when the stream stops before normal EOF, the scan must reject
+    // as incomplete instead of returning partial results.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("scanned");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const started = Date.now();
+      await assert.rejects(backend.scanExact("symbol", () => {}), /did not complete/);
+      assert.ok(Date.now() - started < 2_000);
+      assert.match(await waitForKill(markerPath), /K\d+/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("rejects when the scan visitor throws and kills the child", async () => {
+    // P1: a visitor exception must not escape the EventEmitter callback
+    // or crash Node; the scan rejects and the child is cleaned up.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const boom = new Error("visitor boom");
+      await assert.rejects(
+        backend.scanExact("Symbol", () => {
+          throw boom;
+        }),
+        (error: unknown) => error === boom,
+      );
+      assert.match(await waitForKill(markerPath), /K\d+/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

@@ -2,7 +2,7 @@
  * Symbol reference resolver.
  *
  * Maps parsed references to concrete ProjectSymbols through exact
- * readtags lookups, following deterministic resolution rules:
+ * readtags scans, following deterministic resolution rules:
  *
  * - **Stable token** (`#name@path:line`):
  *   1. Exact match on name + path + line → resolved
@@ -19,8 +19,10 @@
  *   - Dotted stale stable: same parent + member + file (stale line)
  *   - Dotted plain: match by parent + member (unique → resolved, multiple → ambiguous)
  *
- * The backend runs one subprocess per distinct exact name. Repeated
- * references within one call share the pending lookup.
+ * The backend runs one streamed scan per distinct tag name. Repeated
+ * references within one call share the scan. Each reference retains at
+ * most two candidates, so memory stays constant regardless of how many
+ * tags share a name.
  */
 
 import type {
@@ -31,10 +33,52 @@ import type {
   ResolvedReference,
 } from "./types.ts";
 
+// ── Bounded candidate state ─────────────────────────────────────────
+
+/**
+ * Plain-like references keep the first two candidates. The second
+ * candidate already proves ambiguity; `multiple` records when more
+ * candidates arrive so the diagnostic can say so.
+ */
+interface PlainCandidates {
+  candidates: ProjectSymbol[];
+  multiple: boolean;
+}
+
+/**
+ * Stable references keep the first exact name+path+line candidate and
+ * the first same-name same-path candidate (stale fallback). Two slots
+ * are enough to decide resolved/stale/unresolved.
+ */
+interface StableCandidates {
+  exact: ProjectSymbol | null;
+  stale: ProjectSymbol | null;
+}
+
+type CandidateState = PlainCandidates | StableCandidates;
+
+interface GroupMember {
+  ref: ParsedReference;
+  /** True for stable tokens (exact path+line, else stale fallback). */
+  isStable: boolean;
+  /** Split parts for dotted members. */
+  dotted?: { parentName: string; memberName: string };
+  state: CandidateState;
+}
+
+interface KeyGroup {
+  key: string;
+  members: GroupMember[];
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
  * Resolve parsed references against the readtags backend.
+ *
+ * References are grouped by the exact tag name they need, so one scan
+ * serves every reference in the group. Multi-dot and malformed stable
+ * references resolve locally without a scan.
  *
  * Returns structured outcomes with diagnostic metadata, including an
  * `injectable` subset of references that passed ambiguity/uniqueness checks.
@@ -43,14 +87,47 @@ export async function resolveReferences(
   references: ParsedReference[],
   backend: ReadtagsBackend,
 ): Promise<ResolveResult> {
-  // One lookup subprocess per distinct name. Repeated references share
-  // the pending lookup within this call.
-  const lookups = new Map<string, Promise<ProjectSymbol[]>>();
-  const resolved: ResolvedReference[] = [];
+  const groups = new Map<string, KeyGroup>();
+  const ordered: Array<
+    | { kind: "local"; result: ResolvedReference }
+    | { kind: "member"; member: GroupMember }
+  > = [];
 
   for (const ref of references) {
-    resolved.push(await resolveOne(ref, backend, lookups));
+    const dotted = splitDottedName(ref.name);
+    const key = groupKey(ref, dotted);
+    if (key === null) {
+      ordered.push({ kind: "local", result: localUnresolved(ref, dotted) });
+      continue;
+    }
+
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, members: [] };
+      groups.set(key, group);
+    }
+    const member: GroupMember = {
+      ref,
+      isStable: ref.type === "stable",
+      dotted: dotted ?? undefined,
+      state: ref.type === "stable"
+        ? { exact: null, stale: null }
+        : { candidates: [], multiple: false },
+    };
+    group.members.push(member);
+    ordered.push({ kind: "member", member });
   }
+
+  // One scanExact call per distinct key, sequential.
+  for (const group of groups.values()) {
+    await backend.scanExact(group.key, (symbol) => {
+      for (const member of group.members) updateCandidates(member, symbol);
+    });
+  }
+
+  const resolved = ordered.map((slot) =>
+    slot.kind === "local" ? slot.result : deriveResult(slot.member),
+  );
 
   return {
     resolved,
@@ -60,18 +137,43 @@ export async function resolveReferences(
 
 // ── Internal resolution logic ───────────────────────────────────────
 
-/** Look up an exact name once per resolveReferences call. */
-function lookupExact(
-  name: string,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-): Promise<ProjectSymbol[]> {
-  let pending = lookups.get(name);
-  if (!pending) {
-    pending = backend.lookupExact(name);
-    lookups.set(name, pending);
+/**
+ * Return the exact tag name a reference scans, or null when it resolves
+ * locally. Multi-dot names and malformed stable tokens need no scan.
+ */
+function groupKey(
+  ref: ParsedReference,
+  dotted: { parentName: string; memberName: string } | null,
+): string | null {
+  if (dotted) {
+    if (ref.type === "stable" && (ref.path === undefined || ref.line === undefined)) {
+      return null;
+    }
+    return dotted.memberName;
   }
-  return pending;
+  // Multi-dot names (e.g. A.B.C) are unsupported chains in v1.
+  // splitDottedName returned null because the member contains more dots.
+  if (ref.name.includes(".")) return null;
+  if (ref.type === "stable" && (ref.path === undefined || ref.line === undefined)) {
+    return null;
+  }
+  return ref.name;
+}
+
+/** Build the local unresolved outcome for multi-dot and malformed refs. */
+function localUnresolved(
+  ref: ParsedReference,
+  dotted: { parentName: string; memberName: string } | null,
+): ResolvedReference {
+  let message: string;
+  if (dotted) {
+    message = "Malformed dotted stable token: missing path or line";
+  } else if (ref.name.includes(".")) {
+    message = `Unresolved multi-dot reference: "${ref.name}" — dotted chains with more than one dot are not supported in v1`;
+  } else {
+    message = "Malformed stable token: missing path or line";
+  }
+  return { parsed: ref, symbol: null, status: "unresolved", message };
 }
 
 /**
@@ -94,254 +196,108 @@ function splitDottedName(name: string): { parentName: string; memberName: string
   };
 }
 
+/** Return true when the symbol matches the reference identity. */
+function matchesIdentity(member: GroupMember, symbol: ProjectSymbol): boolean {
+  return member.dotted
+    ? symbol.parentName === member.dotted.parentName &&
+        symbol.name === member.dotted.memberName
+    : symbol.name === member.ref.name;
+}
+
 /**
- * Resolve a single parsed reference against the backend.
+ * Fold one streamed symbol into a reference's bounded candidate state.
+ * Plain references keep the first two candidates; stable references
+ * keep the first exact and the first same-file candidate.
  */
-async function resolveOne(
-  ref: ParsedReference,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-): Promise<ResolvedReference> {
-  const dotted = splitDottedName(ref.name);
-  if (dotted) {
-    if (ref.type === "stable") {
-      return resolveDottedStable(ref, backend, lookups, dotted);
+function updateCandidates(member: GroupMember, symbol: ProjectSymbol): void {
+  if (!matchesIdentity(member, symbol)) return;
+
+  if (member.isStable) {
+    const stable = member.state as StableCandidates;
+    if (
+      stable.exact === null &&
+      symbol.path === member.ref.path &&
+      symbol.line === member.ref.line
+    ) {
+      stable.exact = symbol;
     }
-    return resolveDottedPlain(ref, backend, lookups, dotted);
+    if (stable.stale === null && symbol.path === member.ref.path) {
+      stable.stale = symbol;
+    }
+    return;
   }
-  // Multi-dot names (e.g. A.B.C) are unsupported chains in v1.
-  // splitDottedName returned null because the member contains more dots.
-  // Explicitly return unresolved without a backend lookup rather than
-  // falling through to non-dotted resolution which could match a literal
-  // symbol with a dotted name.
-  if (ref.name.includes(".")) {
-    return {
-      parsed: ref,
-      symbol: null,
-      status: "unresolved",
-      message: `Unresolved multi-dot reference: "${ref.name}" — dotted chains with more than one dot are not supported in v1`,
-    };
-  }
-  if (ref.type === "stable") {
-    return resolveStable(ref, backend, lookups);
-  }
-  return resolvePlain(ref, backend, lookups);
+
+  const plain = member.state as PlainCandidates;
+  if (plain.candidates.length < 2) plain.candidates.push(symbol);
+  else plain.multiple = true;
 }
 
-/**
- * Resolve a stable token using the stale chain:
- *
- * 1. Exact name + path + line match → resolved
- * 2. Same name + same file (any line) → stale (line number changed)
- * 3. Otherwise → unresolved
- */
-async function resolveStable(
-  ref: ParsedReference,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-): Promise<ResolvedReference> {
-  const path = ref.path;
-  const line = ref.line;
-  const name = ref.name;
+/** Derive the resolution outcome from the retained candidates. */
+function deriveResult(member: GroupMember): ResolvedReference {
+  const { ref, isStable, dotted } = member;
+  const label = dotted ? `${dotted.parentName}.${dotted.memberName}` : ref.name;
 
-  // Guard: stable tokens always have path and line
-  if (path === undefined || line === undefined) {
+  if (isStable) {
+    const stable = member.state as StableCandidates;
+    if (stable.exact) {
+      return {
+        parsed: ref,
+        symbol: stable.exact,
+        status: "resolved",
+        message: dotted
+          ? `Resolved via exact parent+member+path+line: ${label}@${stable.exact.path}:${stable.exact.line}`
+          : `Resolved via exact name+path+line: ${label}@${stable.exact.path}:${stable.exact.line}`,
+      };
+    }
+    if (stable.stale) {
+      return {
+        parsed: ref,
+        symbol: stable.stale,
+        status: "stale",
+        message: `Stable token line ${ref.line} is stale; resolved to ${label} at ${stable.stale.path}:${stable.stale.line}`,
+      };
+    }
     return {
       parsed: ref,
       symbol: null,
       status: "unresolved",
-      message: `Malformed stable token: missing path or line`,
+      message: `Unresolved ${dotted ? "dotted " : ""}stable token: ${label} not found at ${ref.path}:${ref.line}`,
     };
   }
 
-  const matches = await lookupExact(name, backend, lookups);
-
-  // Step 1: Exact name + path + line match
-  const exactMatch = matches.find(
-    (s) => s.name === name && s.path === path && s.line === line,
-  );
-  if (exactMatch) {
+  const plain = member.state as PlainCandidates;
+  if (plain.candidates.length === 1) {
+    const symbol = plain.candidates[0];
     return {
       parsed: ref,
-      symbol: exactMatch,
+      symbol,
       status: "resolved",
-      message: `Resolved via exact name+path+line: ${name}@${path}:${line}`,
+      message: dotted
+        ? `Resolved unique dotted match: ${label} → ${symbol.path}:${symbol.line}`
+        : `Resolved unique match: ${label} → ${symbol.path}:${symbol.line}`,
     };
   }
 
-  // Step 2: Same name + same file (stale line number)
-  const sameFileMatch = matches.find(
-    (s) => s.name === name && s.path === path,
-  );
-  if (sameFileMatch) {
-    return {
-      parsed: ref,
-      symbol: sameFileMatch,
-      status: "stale",
-      message: `Stable token line ${line} is stale; resolved to ${sameFileMatch.name} at ${path}:${sameFileMatch.line}`,
-    };
-  }
-
-  // Step 3: Unresolved — no cross-file fallback
-  return {
-    parsed: ref,
-    symbol: null,
-    status: "unresolved",
-    message: `Unresolved stable token: ${name} not found at ${path}:${line}`,
-  };
-}
-
-/**
- * Resolve a plain token:
- *
- * - Exactly one symbol with that name → resolved
- * - Multiple → ambiguous (skip)
- * - None → unresolved
- */
-async function resolvePlain(
-  ref: ParsedReference,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-): Promise<ResolvedReference> {
-  const name = ref.name;
-
-  const matches = (await lookupExact(name, backend, lookups)).filter(
-    (s) => s.name === name,
-  );
-
-  if (matches.length === 1) {
-    return {
-      parsed: ref,
-      symbol: matches[0],
-      status: "resolved",
-      message: `Resolved unique match: ${name} → ${matches[0].path}:${matches[0].line}`,
-    };
-  }
-
-  if (matches.length === 0) {
+  if (plain.candidates.length === 0) {
     return {
       parsed: ref,
       symbol: null,
       status: "unresolved",
-      message: `Unresolved plain token: no symbol named "${name}"`,
+      message: dotted
+        ? `Unresolved dotted plain token: no symbol with parent="${dotted.parentName}" and name="${dotted.memberName}"`
+        : `Unresolved plain token: no symbol named "${ref.name}"`,
     };
   }
 
-  // matches.length > 1
-  const paths = matches.map((s) => `${s.path}:${s.line}`).join(", ");
+  // Two or more matches. The diagnostic lists only the retained paths.
+  const paths = plain.candidates.map((s) => `${s.path}:${s.line}`).join(", ");
+  const extra = plain.multiple ? " (more than two matches)" : "";
   return {
     parsed: ref,
     symbol: null,
     status: "ambiguous",
-    message: `Ambiguous plain token: "${name}" matches multiple symbols: ${paths}`,
-  };
-}
-
-/**
- * Resolve a dotted stable token using parent+member identity:
- *
- * 1. Exact parent + member + path + line match → resolved
- * 2. Same parent + member + file (stale line) → stale
- * 3. Otherwise → unresolved (no cross-file fallback)
- */
-async function resolveDottedStable(
-  ref: ParsedReference,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-  dotted: { parentName: string; memberName: string },
-): Promise<ResolvedReference> {
-  const { parentName, memberName } = dotted;
-  const path = ref.path;
-  const line = ref.line;
-
-  if (path === undefined || line === undefined) {
-    return {
-      parsed: ref,
-      symbol: null,
-      status: "unresolved",
-      message: `Malformed dotted stable token: missing path or line`,
-    };
-  }
-
-  const matches = await lookupExact(memberName, backend, lookups);
-
-  // Step 1: Exact parent + member + path + line match
-  const exactMatch = matches.find(
-    (s) => s.parentName === parentName && s.name === memberName && s.path === path && s.line === line,
-  );
-  if (exactMatch) {
-    return {
-      parsed: ref,
-      symbol: exactMatch,
-      status: "resolved",
-      message: `Resolved via exact parent+member+path+line: ${parentName}.${memberName}@${path}:${line}`,
-    };
-  }
-
-  // Step 2: Same parent + member + file (stale line number)
-  const sameFileMatch = matches.find(
-    (s) => s.parentName === parentName && s.name === memberName && s.path === path,
-  );
-  if (sameFileMatch) {
-    return {
-      parsed: ref,
-      symbol: sameFileMatch,
-      status: "stale",
-      message: `Stable token line ${line} is stale; resolved to ${parentName}.${sameFileMatch.name} at ${path}:${sameFileMatch.line}`,
-    };
-  }
-
-  // Step 3: Unresolved — no cross-file fallback
-  return {
-    parsed: ref,
-    symbol: null,
-    status: "unresolved",
-    message: `Unresolved dotted stable token: ${parentName}.${memberName} not found at ${path}:${line}`,
-  };
-}
-
-/**
- * Resolve a dotted plain token:
- *
- * - Exactly one symbol with that parentName + name → resolved
- * - Multiple → ambiguous (skip)
- * - None → unresolved
- */
-async function resolveDottedPlain(
-  ref: ParsedReference,
-  backend: ReadtagsBackend,
-  lookups: Map<string, Promise<ProjectSymbol[]>>,
-  dotted: { parentName: string; memberName: string },
-): Promise<ResolvedReference> {
-  const { parentName, memberName } = dotted;
-
-  const matches = (await lookupExact(memberName, backend, lookups)).filter(
-    (s) => s.parentName === parentName && s.name === memberName,
-  );
-
-  if (matches.length === 1) {
-    return {
-      parsed: ref,
-      symbol: matches[0],
-      status: "resolved",
-      message: `Resolved unique dotted match: ${parentName}.${memberName} → ${matches[0].path}:${matches[0].line}`,
-    };
-  }
-
-  if (matches.length === 0) {
-    return {
-      parsed: ref,
-      symbol: null,
-      status: "unresolved",
-      message: `Unresolved dotted plain token: no symbol with parent="${parentName}" and name="${memberName}"`,
-    };
-  }
-
-  const paths = matches.map((s) => `${s.path}:${s.line}`).join(", ");
-  return {
-    parsed: ref,
-    symbol: null,
-    status: "ambiguous",
-    message: `Ambiguous dotted plain token: "${parentName}.${memberName}" matches multiple symbols: ${paths}`,
+    message: dotted
+      ? `Ambiguous dotted plain token: "${label}" matches multiple symbols${extra}: ${paths}`
+      : `Ambiguous plain token: "${ref.name}" matches multiple symbols${extra}: ${paths}`,
   };
 }

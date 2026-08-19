@@ -299,7 +299,18 @@ function streamReadtags(
       else settle(new Error(`readtags exited with code ${code ?? "signal"}`));
     });
     lines.on("line", (line) => {
-      if (!finished && !onLine(line)) stop("capped");
+      if (finished) return;
+      let keepGoing: boolean;
+      try {
+        keepGoing = onLine(line);
+      } catch (error) {
+        // A visitor exception must kill the child and reject, not escape
+        // the EventEmitter callback and crash the process.
+        child.kill();
+        settle(error as Error);
+        return;
+      }
+      if (!keepGoing) stop("capped");
     });
   });
 }
@@ -330,20 +341,23 @@ async function loadKindAliases(
 export function createReadtagsBackend(options: { tagsFilePath: string; cwd: string; readtagsPath?: string }): ReadtagsBackend {
   const { tagsFilePath, cwd, readtagsPath = "readtags" } = options;
 
-  let aliasesPromise: Promise<Map<string, string>> | null = null;
+  let aliasesPromise: Promise<{ aliases: Map<string, string>; complete: boolean }> | null = null;
 
   function normalizeLimit(limit: number): number {
     if (!Number.isFinite(limit)) return MAX_RESULTS;
     return Math.min(Math.max(Math.trunc(limit), 0), MAX_RESULTS);
   }
 
-  function getAliases(signal: AbortSignal | undefined, deadline: number): Promise<Map<string, string>> {
+  function getAliases(
+    signal: AbortSignal | undefined,
+    deadline: number,
+  ): Promise<{ aliases: Map<string, string>; complete: boolean }> {
     if (aliasesPromise) return aliasesPromise;
 
     aliasesPromise = loadKindAliases(readtagsPath, tagsFilePath, cwd, signal, deadline).then(
-      ({ aliases, complete }) => {
-        if (!complete) aliasesPromise = null;
-        return aliases;
+      (result) => {
+        if (!result.complete) aliasesPromise = null;
+        return result;
       },
       (error: unknown) => {
         aliasesPromise = null;
@@ -362,7 +376,7 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
     if (limit === 0 || signal?.aborted) return;
 
     const deadline = Date.now() + QUERY_TIMEOUT_MS;
-    const aliases = await getAliases(signal, deadline);
+    const { aliases } = await getAliases(signal, deadline);
     if (signal?.aborted || Date.now() >= deadline) return;
 
     let scannedLines = 0;
@@ -415,19 +429,34 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
       return [...exact, ...prefix].slice(0, normalizedLimit);
     },
 
-    async lookupExact(name, limit = MAX_RESULTS) {
-      const normalizedLimit = normalizeLimit(limit);
-      const symbols: ProjectSymbol[] = [];
-      await runQuery(
+    async scanExact(name, onSymbol) {
+      const deadline = Date.now() + QUERY_TIMEOUT_MS;
+      const { aliases, complete } = await getAliases(undefined, deadline);
+      if (!complete) {
+        throw new Error(`kind alias loading was interrupted; exact scan of "${name}" aborted`);
+      }
+
+      let scannedLines = 0;
+      const result = await streamReadtags(
+        readtagsPath,
         ["-t", tagsFilePath, "-e", "-n", "-", name],
-        normalizedLimit,
+        cwd,
         undefined,
-        (symbol) => {
-          symbols.push(symbol);
-          return symbols.length < normalizedLimit;
+        deadline,
+        (line) => {
+          scannedLines += 1;
+          if (scannedLines > MAX_SCANNED_LINES) return false;
+          const symbol = parseTagLine(line, aliases);
+          if (symbol) onSymbol(symbol);
+          return true;
         },
       );
-      return symbols;
+
+      // Any early stop (timeout, line cap, byte cap, child failure) leaves
+      // the output incomplete. Never treat partial exact results as complete.
+      if (result !== "complete") {
+        throw new Error(`exact scan of "${name}" did not complete (${result})`);
+      }
     },
   };
 }
