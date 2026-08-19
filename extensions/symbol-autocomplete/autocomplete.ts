@@ -6,13 +6,17 @@
  * renders disambiguated suggestions, and inserts stable tokens
  * (`#name@path:line`) on selection.
  *
- * A query needs at least one character after `#`. Bare `#`, bare
- * `#Parent.`, and multi-dot chains (`#A.B.C`) delegate to the built-in
- * provider. Backend errors, empty results, and aborted queries also
- * delegate; this provider never throws out of getSuggestions.
+ * A query needs at least one character after `#`. Bare `#` delegates to
+ * the built-in provider. A query with a dot delegates too when it does
+ * not split into one parent and one member: `#Parent.`, `#.foo`, and
+ * multi-dot chains such as `#A.B.C`. The resolver rejects every one of
+ * them, so a stable token built from them would never resolve. Backend
+ * errors, empty results, and aborted queries also delegate; this
+ * provider never throws out of getSuggestions.
  */
 
 import type { ProjectSymbol, ReadtagsBackend } from "./types.ts";
+import { splitDottedName } from "./resolver.ts";
 
 const MAX_LABEL_LENGTH = 96;
 const MAX_DESCRIBED_LABEL_LENGTH = 32;
@@ -87,19 +91,19 @@ export function createSymbolAutocompleteProvider(
         return current.getSuggestions(lines, cursorLine, cursorCol, options);
       }
 
-      const dotIndex = query.indexOf(".");
-      // The resolver rejects multi-dot chains (#A.B.C), so any stable
-      // token built from them would never resolve. Delegate instead.
-      if (dotIndex >= 0 && query.slice(dotIndex + 1).includes(".")) {
+      // A query with a dot must split into one parent and one member.
+      // A query that does not split delegates, because the resolver
+      // rejects it and its stable token would never resolve.
+      const hasDot = query.includes(".");
+      const split = hasDot ? splitDottedName(query) : null;
+      if (hasDot && split === null) {
         return current.getSuggestions(lines, cursorLine, cursorCol, options);
       }
 
       let results: ProjectSymbol[] | null;
       try {
-        results = dotIndex > 0
-          ? (query.slice(dotIndex + 1)
-              ? await backend.queryDotted(query.slice(0, dotIndex), query.slice(dotIndex + 1), MAX_SUGGESTIONS, options.signal)
-              : null)
+        results = split
+          ? await backend.queryDotted(split.parentName, split.memberName, MAX_SUGGESTIONS, options.signal)
           : await backend.queryPrefix(query, MAX_SUGGESTIONS, options.signal);
       } catch {
         results = null;
@@ -117,12 +121,11 @@ export function createSymbolAutocompleteProvider(
       // Never trust the backend beyond the hard cap.
       const capped = results.slice(0, MAX_SUGGESTIONS);
 
-      const isDotted = dotIndex > 0 && query.slice(dotIndex + 1) !== "";
-      const ranked = isDotted
-        ? rankDotted(capped, query.slice(0, dotIndex))
+      const ranked = split
+        ? rankDotted(capped, split.parentName)
         : [...capped].sort(byDepthThenName);
 
-      const items = ranked.map((sym) => formatSymbolItem(sym, capped, isDotted));
+      const items = ranked.map((sym) => formatSymbolItem(sym, capped, split !== null));
 
       return { prefix: `#${query}`, items };
     },

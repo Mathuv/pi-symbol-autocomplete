@@ -35,6 +35,9 @@ const CTAGS_NOT_FOUND = "ctags not found — install universal-ctags";
 const CTAGS_HINT = "ctags failed — install universal-ctags";
 const PROBE_TIMEOUT_MS = 5_000;
 
+/** The two operation kinds the coordinator serializes. */
+type RequestKind = "ensure" | "regenerate";
+
 /** Return the Node error code (e.g. "ENOENT") for an error, or "". */
 function errorCode(err: unknown): string {
   return typeof err === "object" && err !== null && "code" in err
@@ -87,10 +90,8 @@ export function createTagsManager(options: {
   // Permanent queue tail. Each distinct request runs only after the
   // previous request settles, so ctags processes never overlap.
   let tail: Promise<void> = Promise.resolve();
-  // Distinct in-flight or queued ensure request. Same-kind calls join it.
-  let ensureRequest: Promise<void> | null = null;
-  // Distinct in-flight or queued regenerate request. Same-kind calls join it.
-  let regenerateRequest: Promise<void> | null = null;
+  // Distinct in-flight or queued request per kind. Same-kind calls join it.
+  const requests = new Map<RequestKind, Promise<void>>();
   // Number of distinct queued and active requests. isBuilding stays true
   // until this is 0. Coalesced callers do not increment it.
   let pendingDistinct = 0;
@@ -125,10 +126,7 @@ export function createTagsManager(options: {
       const info = await stat(resolvedTagsPath);
       return { size: info.size, mtime: info.mtimeMs };
     } catch (err: unknown) {
-      const code =
-        typeof err === "object" && err !== null && "code" in err
-          ? String((err as { code?: unknown }).code)
-          : "";
+      const code = errorCode(err);
       if (code === "ENOENT" || code === "ENOTDIR") return null;
       throw err;
     }
@@ -245,10 +243,11 @@ export function createTagsManager(options: {
   }
 
   /**
-   * One uncoordinated ensure. The coordinator guards concurrency.
+   * One uncoordinated build. The coordinator guards concurrency.
    * Joins a ctags attempt that started after this request was scheduled.
+   * `useExisting` keeps an existing tags file instead of a new build.
    */
-  async function runEnsure(observedAttempt: number): Promise<void> {
+  async function runBuild(observedAttempt: number, useExisting: boolean): Promise<void> {
     if (obsolete) return;
     if (ctagsAttemptId !== observedAttempt) return;
     status = { ...status, lastError: null };
@@ -257,40 +256,19 @@ export function createTagsManager(options: {
         status = { ...status, engine: "none", lastError: READTAGS_NOT_FOUND };
         return;
       }
-      const info = await statTags();
-      if (info !== null) {
-        status = {
-          ...status,
-          engine: "tags-file",
-          fileSizeBytes: info.size,
-          mtime: info.mtime,
-        };
-        return;
+      if (useExisting) {
+        const info = await statTags();
+        if (info !== null) {
+          status = {
+            ...status,
+            engine: "tags-file",
+            fileSizeBytes: info.size,
+            mtime: info.mtime,
+          };
+          return;
+        }
       }
 
-      await runCtags();
-    } catch (err: unknown) {
-      // A valid live file keeps the tags-file engine; a missing file
-      // clears to none. The catch never hides the primary failure.
-      await recordOutcome(err instanceof Error ? err.message : String(err));
-      // A failed temporary-file cleanup must reject the operation.
-      throw err;
-    }
-  }
-
-  /**
-   * One uncoordinated regenerate. The coordinator guards concurrency.
-   * Joins a ctags attempt that started after this request was scheduled.
-   */
-  async function runRegenerate(observedAttempt: number): Promise<void> {
-    if (obsolete) return;
-    if (ctagsAttemptId !== observedAttempt) return;
-    status = { ...status, lastError: null };
-    try {
-      if (!(await probeReadtags())) {
-        status = { ...status, engine: "none", lastError: READTAGS_NOT_FOUND };
-        return;
-      }
       await runCtags();
     } catch (err: unknown) {
       // A valid live file keeps the tags-file engine; a missing file
@@ -304,18 +282,18 @@ export function createTagsManager(options: {
   /**
    * Operation coordinator. Queued requests run after the active request
    * settles. Same-kind concurrent calls share one promise, including
-   * failures. Each finalizer clears its own request pointer only.
+   * failures. Each finalizer clears its own request entry only.
    */
-  function coordinate(kind: "ensure" | "regenerate"): Promise<void> {
+  function coordinate(kind: RequestKind): Promise<void> {
     // After shutdown, calls become safe no-ops.
     if (obsolete) return Promise.resolve();
-    if (kind === "ensure" && ensureRequest !== null) return ensureRequest;
-    if (kind === "regenerate" && regenerateRequest !== null) return regenerateRequest;
+    const active = requests.get(kind);
+    if (active !== undefined) return active;
 
     pendingDistinct += 1;
     status = { ...status, isBuilding: true };
     const observedAttempt = ctagsAttemptId;
-    const run = kind === "ensure" ? () => runEnsure(observedAttempt) : () => runRegenerate(observedAttempt);
+    const run = () => runBuild(observedAttempt, kind === "ensure");
     // The settled tail cannot reject, so a failure never poisons the queue.
     // The request rejects so callers and shutdown see the failure.
     const request = tail.then(run, run).then(
@@ -333,15 +311,13 @@ export function createTagsManager(options: {
       () => undefined,
       () => undefined,
     );
-    if (kind === "ensure") ensureRequest = request;
-    else regenerateRequest = request;
+    requests.set(kind, request);
     return request;
 
     function finish(): void {
       pendingDistinct -= 1;
-      // Clear only when this finalizer still owns the request pointer.
-      if (ensureRequest === request) ensureRequest = null;
-      if (regenerateRequest === request) regenerateRequest = null;
+      // Clear only when this finalizer still owns the request entry.
+      if (requests.get(kind) === request) requests.delete(kind);
       if (pendingDistinct === 0) status = { ...status, isBuilding: false };
     }
   }

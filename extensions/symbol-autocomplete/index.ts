@@ -76,9 +76,14 @@ export default function symbolAutocompleteExtension(
     const samePath =
       indexManager !== null &&
       backend !== null &&
-      resolve(indexManager.getStatus().tagsPath) === effectiveTagsPath;
+      indexManager.getStatus().tagsPath === effectiveTagsPath;
 
     if (!samePath) {
+      // Stop the old pair before the replacement is created. The old
+      // manager never publishes late tags and no old child survives.
+      backend?.dispose();
+      indexManager?.shutdown().catch(() => {});
+
       // ── Tags manager (uses pi.exec as the underlying executor) ──
       indexManager = createTagsManager({
         cwd: ctx.cwd,
@@ -106,13 +111,16 @@ export default function symbolAutocompleteExtension(
   // ── Session teardown ──────────────────────────────────────────────
 
   // Pi awaits this handler before it tears down the runtime and starts
-  // the replacement extension instance. Clear the lifecycle references
-  // and await the old manager so it can never publish late tags.
+  // the replacement extension instance. Clear the lifecycle references,
+  // dispose the backend, and await the old manager, so no old child
+  // survives and no old manager publishes late tags.
   pi.on("session_shutdown", async () => {
     const oldManager = indexManager;
+    const oldBackend = backend;
     indexManager = null;
     backend = null;
     warmup = freshWarmupState();
+    oldBackend?.dispose();
     if (oldManager) await oldManager.shutdown();
   });
 

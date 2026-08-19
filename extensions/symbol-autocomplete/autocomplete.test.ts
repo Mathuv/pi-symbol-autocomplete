@@ -13,13 +13,14 @@
 
 import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import type { ProjectSymbol, ReadtagsBackend } from "./types.ts";
+import type { ProjectSymbol } from "./types.ts";
 import {
   createSymbolAutocompleteProvider,
   type AutocompleteProvider,
   type AutocompleteItem,
   type AutocompleteSuggestions,
 } from "./autocomplete.ts";
+import { createFakeReadtagsBackend } from "./test-support.ts";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -53,26 +54,6 @@ function mockCurrentProvider(
   return Object.assign(provider, { calls });
 }
 
-/** Create a mock ReadtagsBackend that records calls. */
-function createMockBackend(overrides?: {
-  prefix?: (query: string, limit: number, signal?: AbortSignal) => Promise<ProjectSymbol[]>;
-  dotted?: (parent: string, member: string, limit: number, signal?: AbortSignal) => Promise<ProjectSymbol[]>;
-}): ReadtagsBackend & { calls: Array<{ method: string; args: unknown[] }> } {
-  const calls: Array<{ method: string; args: unknown[] }> = [];
-  const backend: ReadtagsBackend = {
-    async queryPrefix(query, limit, signal) {
-      calls.push({ method: "queryPrefix", args: [query, limit, signal] });
-      return overrides?.prefix ? overrides.prefix(query, limit, signal) : [];
-    },
-    async queryDotted(parent, member, limit, signal) {
-      calls.push({ method: "queryDotted", args: [parent, member, limit, signal] });
-      return overrides?.dotted ? overrides.dotted(parent, member, limit, signal) : [];
-    },
-    async scanExact() {},
-  };
-  return Object.assign(backend, { calls });
-}
-
 function signal(): AbortSignal {
   return AbortSignal.timeout(5000);
 }
@@ -102,8 +83,8 @@ const DOTTED_SYMBOLS: ProjectSymbol[] = [
 void describe("trigger detection", () => {
   void it("triggers on # at line start", async () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend({
-      prefix: async () => [SYMBOLS[0]],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [SYMBOLS[0]],
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -119,8 +100,8 @@ void describe("trigger detection", () => {
 
   void it("triggers on # after whitespace", async () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend({
-      prefix: async () => [SYMBOLS[0]],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [SYMBOLS[0]],
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -134,8 +115,8 @@ void describe("trigger detection", () => {
 
   void it("triggers on # after tab", async () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend({
-      prefix: async () => [SYMBOLS[0]],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [SYMBOLS[0]],
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -150,7 +131,7 @@ void describe("trigger detection", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [] },
     });
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = await provider.getSuggestions(["foo#bar"], 0, 7, { signal: signal() });
@@ -170,7 +151,7 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "@", items: [{ value: "@file.ts", label: "@file.ts" }] },
     });
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = await provider.getSuggestions(["@file"], 0, 5, { signal: signal() });
@@ -185,7 +166,7 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = await provider.getSuggestions(["#"], 0, 1, { signal: signal() });
@@ -200,7 +181,7 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = await provider.getSuggestions(["#Campaign."], 0, 10, { signal: signal() });
@@ -215,8 +196,8 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend({
-      prefix: async () => [],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [],
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -232,8 +213,8 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend({
-      prefix: async () => {
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => {
         throw new Error("readtags failed");
       },
     });
@@ -255,8 +236,8 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend({
-      prefix: async () => deferred,
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => deferred,
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -282,7 +263,7 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = await provider.getSuggestions(["#Campaign.User.name"], 0, 18, { signal: signal() });
@@ -307,8 +288,8 @@ void describe("delegation", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend({
-      dotted: async () => {
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => {
         throw new Error("readtags failed");
       },
     });
@@ -323,7 +304,7 @@ void describe("delegation", () => {
 
   void it("delegates shouldTriggerFileCompletion to current", () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const result = provider.shouldTriggerFileCompletion!(["foo"], 0, 3);
@@ -340,8 +321,8 @@ void describe("routing and bounds", () => {
   void it("routes plain query to queryPrefix with cap 50 and the exact signal", async () => {
     const sig = signal();
     const current = mockCurrentProvider();
-    const backend = createMockBackend({
-      prefix: async (query, limit, signalArg) => {
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async (query, limit, signalArg) => {
         assert.equal(query, "c");
         assert.equal(limit, 50, "cap should be 50");
         assert.equal(signalArg, sig, "abort signal must be forwarded unchanged");
@@ -361,8 +342,8 @@ void describe("routing and bounds", () => {
 
   void it("routes dotted query to queryDotted with parent, member, cap 50, and the exact signal", async () => {
     const sig = signal();
-    const backend = createMockBackend({
-      dotted: async (parent, member, limit, signalArg) => {
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async (parent, member, limit, signalArg) => {
         assert.equal(parent, "camp");
         assert.equal(member, "res");
         assert.equal(limit, 50, "cap should be 50");
@@ -386,8 +367,8 @@ void describe("routing and bounds", () => {
       path: "src/a.ts",
       line: i + 1,
     }));
-    const backend = createMockBackend({
-      prefix: async () => many,
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => many,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -403,8 +384,8 @@ void describe("routing and bounds", () => {
 
 void describe("ranking", () => {
   void it("renders one item per backend result", async () => {
-    const backend = createMockBackend({
-      prefix: async () => [SYMBOLS[0], SYMBOLS[1], SYMBOLS[3]],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [SYMBOLS[0], SYMBOLS[1], SYMBOLS[3]],
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -424,8 +405,8 @@ void describe("ranking", () => {
       { name: "Helper", kind: "function", path: "src/helper.ts", line: 1 },
       { name: "Helper", kind: "function", path: "src/utils/helper.ts", line: 1 },
     ];
-    const backend = createMockBackend({
-      prefix: async () => symbols,
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -449,9 +430,9 @@ void describe("ranking", () => {
       { name: "Zebra", kind: "class", path: "src/zebra.ts", line: 2 },
       { name: "alpha", kind: "class", path: "src/alpha.ts", line: 1 },
     ];
-    const backend = createMockBackend({
+    const backend = createFakeReadtagsBackend({
       // Backend returns the reverse of the sorted order.
-      prefix: async () => [...symbols].reverse(),
+      queryPrefix: async () => [...symbols].reverse(),
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -476,8 +457,8 @@ void describe("ranking", () => {
       // Exact parent match, same depth, name sorts first.
       { name: "reservation_date", kind: "variable", parentName: "Campaign", path: "dsp/models.py", line: 208 },
     ];
-    const backend = createMockBackend({
-      dotted: async () => symbols,
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -499,8 +480,8 @@ void describe("ranking", () => {
   });
 
   void it("suggests scoped members for a dotted prefix query", async () => {
-    const backend = createMockBackend({
-      dotted: async () => [DOTTED_SYMBOLS[1], DOTTED_SYMBOLS[2]],
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => [DOTTED_SYMBOLS[1], DOTTED_SYMBOLS[2]],
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -522,8 +503,8 @@ void describe("ranking", () => {
   });
 
   void it("supports prefix parent + prefix member", async () => {
-    const backend = createMockBackend({
-      dotted: async () => [DOTTED_SYMBOLS[1], DOTTED_SYMBOLS[2]],
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => [DOTTED_SYMBOLS[1], DOTTED_SYMBOLS[2]],
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -539,8 +520,8 @@ void describe("ranking", () => {
     const current = mockCurrentProvider({
       defaultResult: { prefix: "", items: [{ value: "fallback", label: "fallback" }] },
     });
-    const backend = createMockBackend({
-      dotted: async () => [],
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => [],
     });
     const provider = createSymbolAutocompleteProvider(current, backend);
 
@@ -552,8 +533,8 @@ void describe("ranking", () => {
   });
 
   void it("preserves non-dotted query behavior", async () => {
-    const backend = createMockBackend({
-      prefix: async () => [DOTTED_SYMBOLS[0]],
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => [DOTTED_SYMBOLS[0]],
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -570,8 +551,8 @@ void describe("ranking", () => {
 
 void describe("disambiguation", () => {
   void it("includes path:line in description for duplicate symbol names", async () => {
-    const backend = createMockBackend({
-      prefix: async () => SYMBOLS.filter((s) => s.name === "MyService"),
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => SYMBOLS.filter((s) => s.name === "MyService"),
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -601,8 +582,8 @@ void describe("disambiguation", () => {
     many.unshift({ name: "Dup", kind: "class", path: "src/dup-keep.ts", line: 1 });
     many.push({ name: "Dup", kind: "class", path: "src/dup-dropped.ts", line: 99 });
 
-    const backend = createMockBackend({
-      prefix: async () => many,
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => many,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -633,8 +614,8 @@ void describe("disambiguation", () => {
       },
     ];
 
-    const backend = createMockBackend({
-      prefix: async () => symbols,
+    const backend = createFakeReadtagsBackend({
+      queryPrefix: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
     const line = "#SalesChannelCon";
@@ -656,8 +637,8 @@ void describe("disambiguation", () => {
       { name: "value", kind: "property", parentName: "Foo", path: "src/b.ts", line: 20 },
     ];
 
-    const backend = createMockBackend({
-      dotted: async () => dupeSymbols,
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => dupeSymbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
 
@@ -684,8 +665,8 @@ void describe("disambiguation", () => {
       },
     ];
 
-    const backend = createMockBackend({
-      dotted: async () => symbols,
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
     const line = "#CmsConnectionInfo.sema";
@@ -712,8 +693,8 @@ void describe("disambiguation", () => {
       },
     ];
 
-    const backend = createMockBackend({
-      dotted: async () => symbols,
+    const backend = createFakeReadtagsBackend({
+      queryDotted: async () => symbols,
     });
     const provider = createSymbolAutocompleteProvider(mockCurrentProvider(), backend);
     const line = "#ParentNameThatIsAlsoFarLongerThanNormalAndWouldOverwhelmTheAutocompleteMenu.member";
@@ -738,7 +719,7 @@ void describe("disambiguation", () => {
 void describe("insertion", () => {
   void it("inserts stable token format #name@path:line on selection", () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const sym: ProjectSymbol = { name: "MyService", kind: "class", path: "src/services/my-service.ts", line: 10 };
@@ -760,7 +741,7 @@ void describe("insertion", () => {
 
   void it("delegates applyCompletion to current provider", () => {
     const current = mockCurrentProvider();
-    const backend = createMockBackend();
+    const backend = createFakeReadtagsBackend();
     const provider = createSymbolAutocompleteProvider(current, backend);
 
     const item: AutocompleteItem = { value: "#Foo@src/foo.ts:1", label: "#Foo" };

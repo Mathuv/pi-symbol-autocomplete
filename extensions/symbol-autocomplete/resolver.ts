@@ -22,10 +22,11 @@
  * The backend runs one streamed scan per distinct tag name. Repeated
  * references within one call share the scan. At most 8 distinct names
  * are admitted, in first-reference order; references for later distinct
- * names resolve locally as omitted by the limit. One 5 s total deadline
- * bounds alias loading and every admitted scan. Each reference retains
- * at most two candidates, so memory stays constant regardless of how
- * many tags share a name.
+ * names resolve locally as omitted by the limit. The admitted scans run
+ * concurrently, at most 8. One 5 s total deadline bounds alias loading
+ * and every admitted scan. Each reference retains at most two
+ * candidates, so memory stays constant regardless of how many tags
+ * share a name.
  */
 
 import type {
@@ -99,10 +100,14 @@ type OrderedSlot =
  *
  * Returns structured outcomes with diagnostic metadata, including an
  * `injectable` subset of references that passed ambiguity/uniqueness checks.
+ *
+ * `deadlineMs` bounds every admitted scan together. Only tests set it;
+ * production keeps the 5 s default.
  */
 export async function resolveReferences(
   references: ParsedReference[],
   backend: ReadtagsBackend,
+  options?: { deadlineMs?: number },
 ): Promise<ResolveResult> {
   const groups = new Map<string, KeyGroup>();
   const ordered: OrderedSlot[] = [];
@@ -137,18 +142,26 @@ export async function resolveReferences(
     ordered.push({ kind: "member", member });
   }
 
-  // One scanExact call per admitted key, sequential, under ONE total
-  // deadline. A deadline abort rejects the active scan and this call.
+  // One scanExact call per admitted key. The scans run concurrently, at
+  // most 8, under ONE total deadline. Each group writes only its own
+  // members, so the callbacks stay independent. A deadline abort rejects
+  // the active scans and this call.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RESOLVE_DEADLINE_MS);
+  const timer = setTimeout(() => controller.abort(), options?.deadlineMs ?? RESOLVE_DEADLINE_MS);
   try {
-    for (const group of groups.values()) {
-      await backend.scanExact(group.key, (symbol) => {
-        for (const member of group.members) updateCandidates(member, symbol);
-      }, controller.signal);
-    }
+    await Promise.all(
+      [...groups.values()].map((group) =>
+        backend.scanExact(group.key, (symbol) => {
+          for (const member of group.members) updateCandidates(member, symbol);
+        }, controller.signal),
+      ),
+    );
   } finally {
     clearTimeout(timer);
+    // One rejected scan rejects this call at once. Abort the shared
+    // controller, so no sibling scan streams on until the deadline.
+    // After a full success the abort has no observers.
+    controller.abort();
   }
 
   const resolved = ordered.map((slot) =>
@@ -230,8 +243,10 @@ function limitUnresolved(
 /**
  * Split a dotted name into parent and member parts.
  * Returns null if the name doesn't contain a valid dot separation.
+ * The autocomplete provider shares this rule, so `#Parent.`, `#.foo`,
+ * and `#A.B.C` behave the same in both places.
  */
-function splitDottedName(name: string): { parentName: string; memberName: string } | null {
+export function splitDottedName(name: string): { parentName: string; memberName: string } | null {
   const dotIndex = name.indexOf(".");
   if (dotIndex <= 0 || dotIndex >= name.length - 1) {
     return null;

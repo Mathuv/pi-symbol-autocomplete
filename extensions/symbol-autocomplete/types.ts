@@ -10,8 +10,6 @@ export interface ProjectSymbol {
   line: number;
   /** Optional end line for multi-line definitions (e.g. classes, functions). */
   endLine?: number;
-  /** Scope depth within the file. 0 = file-level. */
-  depth?: number;
   /** Parent symbol name for scoped members (e.g. class name for a property). */
   parentName?: string;
 }
@@ -95,6 +93,14 @@ export interface ReadtagsBackend {
    * scan; an aborted scan rejects as incomplete.
    */
   scanExact(name: string, onSymbol: (symbol: ProjectSymbol) => void, signal?: AbortSignal): Promise<void>;
+
+  /**
+   * Stop the backend for session teardown. Idempotent.
+   * Active children die through the composed lifetime signal. After
+   * `dispose()` the prefix and dotted queries resolve with an empty
+   * array and an exact scan rejects as interrupted.
+   */
+  dispose(): void;
 }
 
 /** Default directory exclude patterns. */

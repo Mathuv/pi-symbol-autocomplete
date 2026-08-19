@@ -14,6 +14,13 @@
  * - per-line byte cap (64 KiB),
  * - timeout (5 s),
  * - abort via an AbortSignal.
+ *
+ * The backend owns a lifetime AbortController. Every child runs under a
+ * signal composed from that lifetime signal and the caller signal, so
+ * `dispose()` kills every active child. A caller that leaves the shared
+ * kind-alias load does not kill it. That child stays bounded: it lives
+ * until its own 5 s deadline or until `dispose()`, then it takes SIGTERM
+ * and then SIGKILL after the 200 ms grace.
  */
 
 import { spawn } from "node:child_process";
@@ -206,7 +213,6 @@ export function parseTagLine(line: string, aliases: Map<string, string>): Projec
     path: rawPath.replace(/^\.\//, ""),
     line: lineNumber,
     endLine,
-    depth: hasScope ? 1 : 0,
     parentName,
   };
 }
@@ -218,6 +224,14 @@ export function parseTagLine(line: string, aliases: Map<string, string>): Projec
  * The promise reports whether the stream completed, hit a callback cap, or stopped early.
  */
 type StreamResult = "complete" | "capped" | "interrupted";
+
+/**
+ * The reason one stream stopped early. `ok: true` carries the early stop
+ * reason; `ok: false` carries the failure that must reject the promise.
+ */
+type StopOutcome =
+  | { ok: true; result: Exclude<StreamResult, "complete"> }
+  | { ok: false; error: unknown };
 
 function streamReadtags(
   command: string,
@@ -242,9 +256,9 @@ function streamReadtags(
     }
 
     let finished = false;
-    let failed = false;
-    let failure: unknown;
-    let result: StreamResult = "complete";
+    // The early stop reason, or null while the stream still runs.
+    // A null outcome at settlement means the stream reached normal EOF.
+    let outcome: StopOutcome | null = null;
     let pendingBytes = 0;
     let timer: NodeJS.Timeout | undefined;
     let graceTimer: NodeJS.Timeout | undefined;
@@ -262,42 +276,27 @@ function streamReadtags(
       byteCap.destroy();
     };
 
-    const settleSuccess = () => {
+    // Settle from the single outcome. A failure rejects for any thrown
+    // value, including falsy ones. A thrown `undefined` must not resolve
+    // a partial scan as if it completed.
+    const settle = () => {
       if (finished) return;
       cleanup();
-      resolve(result);
-    };
-
-    // Reject for any thrown value, including falsy ones. A thrown
-    // `undefined` must not resolve a partial scan as if it completed.
-    const settleFailure = (error: unknown) => {
-      if (finished) return;
-      cleanup();
-      reject(error);
+      if (outcome === null) resolve("complete");
+      else if (outcome.ok) resolve(outcome.result);
+      else reject(outcome.error);
     };
 
     // Stop the child and settle only after its close event. A short
     // grace timer escalates to SIGKILL when the child ignores SIGTERM,
     // so the promise never settles while the child remains alive.
-    const stop = (nextResult: Exclude<StreamResult, "complete">) => {
+    const stop = (nextOutcome: StopOutcome) => {
       if (finished || stopping) return;
       stopping = true;
       clearTimeout(timer);
-      result = nextResult;
+      outcome = nextOutcome;
       child.kill();
-      if (childClosed) settleSuccess();
-      else graceTimer = setTimeout(() => child.kill("SIGKILL"), STOP_GRACE_MS);
-    };
-
-    // Stop the child for a visitor failure and reject after close.
-    const stopFailure = (error: unknown) => {
-      if (finished || stopping) return;
-      stopping = true;
-      clearTimeout(timer);
-      failed = true;
-      failure = error;
-      child.kill();
-      if (childClosed) settleFailure(error);
+      if (childClosed) settle();
       else graceTimer = setTimeout(() => child.kill("SIGKILL"), STOP_GRACE_MS);
     };
 
@@ -308,7 +307,7 @@ function streamReadtags(
           if (chunk[index] !== 0x0a) continue;
           const lineBytes = pendingBytes + index - start;
           if (lineBytes > MAX_LINE_BYTES) {
-            stop("interrupted");
+            stop({ ok: true, result: "interrupted" });
             callback();
             return;
           }
@@ -321,7 +320,7 @@ function streamReadtags(
         if (pendingBytes + tailBytes > MAX_LINE_BYTES) {
           const allowed = MAX_LINE_BYTES - pendingBytes;
           if (allowed > 0) this.push(chunk.subarray(start, start + allowed));
-          stop("interrupted");
+          stop({ ok: true, result: "interrupted" });
           callback();
           return;
         }
@@ -332,16 +331,22 @@ function streamReadtags(
     });
     lines = createInterface({ input: child.stdout.pipe(byteCap) });
 
-    abort = () => stop("interrupted");
+    abort = () => stop({ ok: true, result: "interrupted" });
     signal?.addEventListener("abort", abort, { once: true });
     timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
-    child.on("error", (error) => settleFailure(error));
+    child.on("error", (error) => {
+      outcome = { ok: false, error };
+      settle();
+    });
     child.on("close", (code) => {
       childClosed = true;
       clearTimeout(graceTimer);
-      if (failed) settleFailure(failure);
-      else if (result !== "complete" || code === 0) settleSuccess();
-      else settleFailure(new Error(`readtags exited with code ${code ?? "signal"}`));
+      // An early stop already fixed the outcome. Without an early stop a
+      // non-zero exit fails and a zero exit is a complete stream.
+      if (outcome === null && code !== 0) {
+        outcome = { ok: false, error: new Error(`readtags exited with code ${code ?? "signal"}`) };
+      }
+      settle();
     });
     lines.on("line", (line) => {
       if (finished || stopping) return;
@@ -352,13 +357,16 @@ function streamReadtags(
         // A visitor exception must kill the child and reject, not escape
         // the EventEmitter callback and crash the process. Falsy thrown
         // values reject too; they never resolve a partial scan.
-        stopFailure(error);
+        stop({ ok: false, error });
         return;
       }
-      if (!keepGoing) stop("capped");
+      if (!keepGoing) stop({ ok: true, result: "capped" });
     });
   });
 }
+
+/** One kind-alias load: the parsed aliases and whether the load finished. */
+type AliasResult = { aliases: Map<string, string>; complete: boolean };
 
 /** Load language kind aliases once from `readtags -D` output. */
 async function loadKindAliases(
@@ -367,7 +375,7 @@ async function loadKindAliases(
   cwd: string,
   signal: AbortSignal | undefined,
   deadline: number,
-): Promise<{ aliases: Map<string, string>; complete: boolean }> {
+): Promise<AliasResult> {
   const aliases = new Map<string, string>();
   let lineCount = 0;
   let aliasCapReached = false;
@@ -392,137 +400,110 @@ async function loadKindAliases(
 /**
  * Create a readtags query backend.
  * The tags file must already exist at `tagsFilePath`.
+ * `queryTimeoutMs` bounds one alias load and one query. Only tests set
+ * it; production keeps the 5 s default.
  */
-export function createReadtagsBackend(options: { tagsFilePath: string; cwd: string; readtagsPath?: string }): ReadtagsBackend {
-  const { tagsFilePath, cwd, readtagsPath = "readtags" } = options;
+export function createReadtagsBackend(options: {
+  tagsFilePath: string;
+  cwd: string;
+  readtagsPath?: string;
+  queryTimeoutMs?: number;
+}): ReadtagsBackend {
+  const {
+    tagsFilePath,
+    cwd,
+    readtagsPath = "readtags",
+    queryTimeoutMs = QUERY_TIMEOUT_MS,
+  } = options;
 
-  // One shared kind-alias load. The load has its own AbortController and
-  // its own deadline; callers wait with their own signal and deadline.
-  // The load is cached only when complete (normal EOF or the intentional
-  // alias cap). An incomplete or failed load is never cached and never
-  // reaches a caller's map.
-  interface SharedAliasLoad {
-    controller: AbortController;
-    deadline: number;
-    /** Active waiters on this load. */
-    waiters: number;
-    /** True once the load promise settled. */
-    done: boolean;
-    promise: Promise<{ aliases: Map<string, string>; complete: boolean }>;
+  // Backend lifetime. dispose() aborts it. Every child runs under a
+  // signal composed from the lifetime signal and the caller signal, so
+  // dispose() kills every active child.
+  const lifetime = new AbortController();
+
+  /** Compose the backend lifetime signal with one caller signal. */
+  function composeSignal(signal: AbortSignal | undefined): AbortSignal {
+    return signal === undefined ? lifetime.signal : AbortSignal.any([lifetime.signal, signal]);
   }
 
-  let sharedLoad: SharedAliasLoad | null = null;
+  // The cached kind-alias load. The load runs under the lifetime signal
+  // and its own deadline, so one caller's abort never kills a load that
+  // another caller waits on. Only a complete load (normal EOF or the
+  // intentional alias cap) stays cached. An incomplete or failed load
+  // clears the cache, so the next caller starts a fresh load.
+  let aliasLoad: Promise<AliasResult> | null = null;
 
-  function getSharedLoad(): SharedAliasLoad {
-    if (sharedLoad !== null) return sharedLoad;
-    const controller = new AbortController();
-    const state: SharedAliasLoad = {
-      controller,
-      deadline: Date.now() + QUERY_TIMEOUT_MS,
-      waiters: 0,
-      done: false,
-      promise: null as unknown as SharedAliasLoad["promise"],
-    };
-    state.promise = loadKindAliases(
+  function startAliasLoad(): Promise<AliasResult> {
+    if (aliasLoad !== null) return aliasLoad;
+    const load = loadKindAliases(
       readtagsPath,
       tagsFilePath,
       cwd,
-      controller.signal,
-      state.deadline,
+      lifetime.signal,
+      Date.now() + queryTimeoutMs,
     ).then(
       (result) => {
-        state.done = true;
         // An incomplete load must not stay cached for the next caller.
-        if (!result.complete) sharedLoad = null;
+        if (!result.complete && aliasLoad === load) aliasLoad = null;
         return result;
       },
       (error: unknown) => {
-        state.done = true;
-        sharedLoad = null;
+        if (aliasLoad === load) aliasLoad = null;
         throw error;
       },
     );
-    sharedLoad = state;
-    return state;
+    aliasLoad = load;
+    return load;
   }
 
   /**
-   * Wait on the shared alias load with one caller's signal and deadline.
-   * The caller's abort or timeout ends only its own wait; the shared
-   * subprocess is aborted only when the final waiter leaves before the
-   * load completes.
+   * Wait for the cached alias load with one caller's signal and deadline.
+   * Returns null when the caller leaves through an abort or its deadline.
+   * The load itself keeps running for the callers that stay.
    */
-  function waitForShared(
+  function waitForAliases(
     signal: AbortSignal | undefined,
     deadline: number,
-  ): Promise<
-    | { kind: "left" }
-    | { kind: "result"; result: { aliases: Map<string, string>; complete: boolean } }
-  > {
-    if (signal?.aborted || Date.now() >= deadline) {
-      return Promise.resolve({ kind: "left" });
-    }
-    const state = getSharedLoad();
-    state.waiters += 1;
+  ): Promise<AliasResult | null> {
+    const composed = composeSignal(signal);
+    if (composed.aborted || Date.now() >= deadline) return Promise.resolve(null);
+    const load = startAliasLoad();
     return new Promise((resolve, reject) => {
       let finished = false;
-      const finish = (
-        outcome:
-          | { kind: "left" }
-          | { kind: "result"; result: { aliases: Map<string, string>; complete: boolean } }
-          | { kind: "error"; error: unknown },
-      ) => {
+      const finish = (settleCaller: () => void) => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-        state.waiters -= 1;
-        if (outcome.kind === "error") {
-          reject(outcome.error);
-          return;
-        }
-        // A caller that leaves (abort or deadline) and is the final waiter
-        // before the load settles aborts the shared subprocess and awaits
-        // its settlement. No alias child survives the final caller's
-        // resolution, even a SIGTERM-ignoring child that needs the
-        // SIGKILL grace. Non-final leaves stay immediate.
-        if (outcome.kind === "left" && state.waiters === 0 && !state.done) {
-          state.controller.abort();
-          state.promise.then(
-            () => resolve(outcome),
-            () => resolve(outcome),
-          );
-          return;
-        }
-        resolve(outcome);
+        composed.removeEventListener("abort", onLeave);
+        settleCaller();
       };
-      const onAbort = () => finish({ kind: "left" });
-      const timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));
-      signal?.addEventListener("abort", onAbort, { once: true });
-      state.promise.then(
-        (result) => finish({ kind: "result", result }),
-        (error: unknown) => finish({ kind: "error", error }),
+      const onLeave = () => finish(() => resolve(null));
+      const timer = setTimeout(onLeave, Math.max(0, deadline - Date.now()));
+      composed.addEventListener("abort", onLeave, { once: true });
+      load.then(
+        (result) => finish(() => resolve(result)),
+        (error: unknown) => finish(() => reject(error)),
       );
     });
   }
 
   /**
-   * Load aliases for one caller, retrying once after an incomplete shared
-   * load. Returns null when the caller left (abort or deadline). A partial
+   * Load aliases for one caller, retrying once after an incomplete load.
+   * Returns null when the caller left (abort or deadline). A partial
    * alias map never reaches a caller.
    */
   async function loadAliases(
     signal: AbortSignal | undefined,
     deadline: number,
   ): Promise<Map<string, string> | null> {
-    const first = await waitForShared(signal, deadline);
-    if (first.kind === "left") return null;
-    if (first.result.complete) return first.result.aliases;
-    // The shared load ended incomplete. Retry once with a fresh load while
-    // this caller remains active; a still-incomplete load rejects.
-    const second = await waitForShared(signal, deadline);
-    if (second.kind === "left") return null;
-    if (second.result.complete) return second.result.aliases;
+    const first = await waitForAliases(signal, deadline);
+    if (first === null) return null;
+    if (first.complete) return first.aliases;
+    // The load ended incomplete. Retry once with a fresh load while this
+    // caller remains active; a still-incomplete load rejects.
+    const second = await waitForAliases(signal, deadline);
+    if (second === null) return null;
+    if (second.complete) return second.aliases;
     throw new Error("kind alias loading did not complete");
   }
 
@@ -537,15 +518,16 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
     signal: AbortSignal | undefined,
     collect: (symbol: ProjectSymbol) => boolean,
   ): Promise<void> {
-    if (limit === 0 || signal?.aborted) return;
+    if (limit === 0 || signal?.aborted || lifetime.signal.aborted) return;
 
-    const deadline = Date.now() + QUERY_TIMEOUT_MS;
+    const deadline = Date.now() + queryTimeoutMs;
     const aliases = await loadAliases(signal, deadline);
-    // The caller aborted or its deadline passed during alias loading.
+    // The caller aborted, the backend was disposed, or the deadline
+    // passed during alias loading.
     if (aliases === null) return;
 
     let scannedLines = 0;
-    await streamReadtags(readtagsPath, args, cwd, signal, deadline, (line) => {
+    await streamReadtags(readtagsPath, args, cwd, composeSignal(signal), deadline, (line) => {
       scannedLines += 1;
       if (scannedLines > MAX_SCANNED_LINES) return false;
 
@@ -595,12 +577,13 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
     },
 
     async scanExact(name, onSymbol, signal) {
-      const deadline = Date.now() + QUERY_TIMEOUT_MS;
+      const deadline = Date.now() + queryTimeoutMs;
       // Route through the shared retry path like the other query methods.
-      // An interrupted shared load is retried once; a partial alias map
-      // never reaches the scan.
+      // An interrupted load is retried once; a partial alias map never
+      // reaches the scan.
       const aliases = await loadAliases(signal, deadline);
-      // The caller aborted or the deadline passed while aliases loaded.
+      // The caller aborted, the backend was disposed, or the deadline
+      // passed while aliases loaded.
       if (aliases === null) {
         throw new Error(`kind alias loading was interrupted; exact scan of "${name}" aborted`);
       }
@@ -610,7 +593,7 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
         readtagsPath,
         ["-t", tagsFilePath, "-e", "-n", "-", name],
         cwd,
-        signal,
+        composeSignal(signal),
         deadline,
         (line) => {
           scannedLines += 1;
@@ -626,6 +609,10 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
       if (result !== "complete") {
         throw new Error(`exact scan of "${name}" did not complete (${result})`);
       }
+    },
+
+    dispose() {
+      lifetime.abort();
     },
   };
 }

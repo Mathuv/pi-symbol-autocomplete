@@ -9,15 +9,21 @@
  * readtags is not on PATH.
  */
 
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import { createReadtagsBackend, parseTagLine } from "./readtags-backend.ts";
 import type { ProjectSymbol } from "./types.ts";
+import {
+  hasBinary,
+  makeTempDir,
+  pollUntil,
+  removeTempDir,
+  withTempDir,
+} from "./test-support.ts";
 
 // ── parseTagLine unit tests ─────────────────────────────────────────
 
@@ -42,7 +48,6 @@ void describe("parseTagLine", () => {
     assert.equal(sym.name, "MyClass");
     assert.equal(sym.path, "a.ts");
     assert.equal(sym.line, 1);
-    assert.equal(sym.depth, 0);
   });
 
   void it("normalizes a bare short kind via the common alias map", () => {
@@ -68,14 +73,12 @@ void describe("parseTagLine", () => {
     const sym = parseTagLine(tagLine("x", "a.ts", ["kind:property", "line:2", "scope:interface:MyInterface"]), new Map());
     assert.ok(sym !== null);
     assert.equal(sym.parentName, "MyInterface");
-    assert.equal(sym.depth, 1);
   });
 
   void it("parses the bare interface:X scope form", () => {
     const sym = parseTagLine(tagLine("x", "a.ts", ["kind:property", "line:2", "interface:MyInterface"]), new Map());
     assert.ok(sym !== null);
     assert.equal(sym.parentName, "MyInterface");
-    assert.equal(sym.depth, 1);
   });
 
   void it("includes a class-scoped variable", () => {
@@ -83,7 +86,6 @@ void describe("parseTagLine", () => {
     assert.ok(sym !== null);
     assert.equal(sym.kind, "variable");
     assert.equal(sym.parentName, "Campaign");
-    assert.equal(sym.depth, 1);
   });
 
   void it("excludes a function-scoped variable", () => {
@@ -101,7 +103,6 @@ void describe("parseTagLine", () => {
     assert.ok(sym !== null);
     assert.equal(sym.kind, "variable");
     assert.equal(sym.parentName, undefined);
-    assert.equal(sym.depth, 0);
   });
 
   void it("excludes kinds outside DEFINITION_KINDS", () => {
@@ -129,9 +130,8 @@ void describe("parseTagLine", () => {
 
 // ── Integration tests against the real readtags binary ──────────────
 
-const readtagsPresent = spawnSync("readtags", ["--version"]).status === 0;
-const ctagsPresent = spawnSync("ctags", ["--version"]).status === 0;
-const integrationAvailable = readtagsPresent && ctagsPresent;
+const readtagsPresent = hasBinary("readtags");
+const integrationAvailable = readtagsPresent && hasBinary("ctags");
 
 const CAMPAIGN_FIXTURE = [
   "def helper():",
@@ -150,11 +150,10 @@ const CAMPAIGN_FIXTURE = [
 ].join("\n");
 
 /**
- * Generate a fixture tags file in a temp directory.
- * Returns the directory and the tags file path.
+ * Generate a fixture tags file with real ctags inside `dir`.
+ * Returns the tags file path.
  */
-function createFixture(files: Array<{ name: string; content: string }>): { dir: string; tagsPath: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rt-backend-"));
+function createFixture(dir: string, files: Array<{ name: string; content: string }>): string {
   for (const file of files) {
     fs.writeFileSync(path.join(dir, file.name), file.content);
   }
@@ -164,11 +163,10 @@ function createFixture(files: Array<{ name: string; content: string }>): { dir: 
     { cwd: dir },
   );
   assert.equal(result.status, 0, `ctags failed: ${result.stderr.toString()}`);
-  return { dir, tagsPath: path.join(dir, "tags") };
+  return path.join(dir, "tags");
 }
 
-function createReadtagsShim(mode: string): { dir: string; tagsPath: string; command: string; markerPath: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rt-shim-"));
+function createReadtagsShim(dir: string, mode: string): { tagsPath: string; command: string; markerPath: string } {
   const tagsPath = path.join(dir, "tags");
   const markerPath = path.join(dir, "marker");
   const command = path.join(dir, "readtags");
@@ -255,147 +253,111 @@ if (alias) {
 }
 `);
   fs.chmodSync(command, 0o755);
-  return { dir, tagsPath, command, markerPath };
+  return { tagsPath, command, markerPath };
 }
 
 function readMarker(markerPath: string): string {
   return fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8") : "";
 }
 
-async function waitForMarker(markerPath: string, value: string): Promise<string> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const marker = readMarker(markerPath);
-    if (marker.includes(value)) return marker;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  return readMarker(markerPath);
-}
-
-async function waitForKill(markerPath: string): Promise<string> {
-  return waitForMarker(markerPath, "K");
-}
-
 void describe("readtags backend bounds", () => {
   void it("kills the child at the result cap", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "results");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       assert.equal((await backend.queryPrefix("symbol", 5)).length, 5);
-      const marker = await waitForKill(markerPath);
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      const marker = readMarker(markerPath);
       assert.match(marker, /K\d+/);
       assert.ok(Number.parseInt(marker.match(/K(\d+)/)![1], 10) < 500);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("kills the child at the scanned-line cap", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("scanned");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "scanned");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const started = Date.now();
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
-      assert.match(await waitForKill(markerPath), /K\d+/);
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.match(readMarker(markerPath), /K\d+/);
       assert.ok(Date.now() - started < 2_000);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("kills the child for a line longer than 64 KiB", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("huge-line");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "huge-line");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const started = Date.now();
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
       assert.ok(Date.now() - started < 2_000);
-      assert.match(await waitForKill(markerPath), /K0/);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.match(readMarker(markerPath), /K0/);
+    });
   });
 
   void it("does not spawn for an aborted signal or a zero limit", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "results");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const controller = new AbortController();
       controller.abort();
       assert.deepEqual(await backend.queryPrefix("symbol", 50, controller.signal), []);
       assert.deepEqual(await backend.queryPrefix("symbol", 0), []);
       assert.equal(readMarker(markerPath), "");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("applies one deadline to alias loading and the query", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "slow-alias");
+      // The test seam shortens the 5 s default to 500 ms. Two deadlines
+      // would need about 1 000 ms, so the bound below rejects them.
+      const backend = createReadtagsBackend({
+        tagsFilePath: tagsPath,
+        cwd: dir,
+        readtagsPath: command,
+        queryTimeoutMs: 500,
+      });
       const started = Date.now();
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
-      assert.ok(Date.now() - started < 5_500);
-      assert.equal(await waitForKill(markerPath), "D\nK0");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 900, `one deadline must bound the alias load and the query (took ${elapsed} ms)`);
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.equal(readMarker(markerPath), "D\nK0");
+    });
   });
 
   void it("caches aliases after the alias cap", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-cap");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "alias-cap");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       await backend.queryPrefix("symbol", 1);
       await backend.queryPrefix("symbol", 1);
       assert.equal(readMarker(markerPath).match(/D/g)?.length, 1);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  void it("retries aliases after an aborted alias load", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
-      const controller = new AbortController();
-      const firstQuery = backend.queryPrefix("aliased", 50, controller.signal);
-      assert.match(await waitForMarker(markerPath, "D"), /D/);
-      controller.abort();
-      assert.deepEqual(await firstQuery, []);
-
-      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
-      const symbols = await backend.queryPrefix("aliased", 50);
-      assert.deepEqual(symbols.map((symbol) => symbol.name), ["Aliased"]);
-      assert.equal(symbols[0].kind, "class");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("ranks an exact dotted parent before a prefix parent", async () => {
-    const { dir, tagsPath, command } = createReadtagsShim("dotted");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command } = createReadtagsShim(dir, "dotted");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       assert.deepEqual((await backend.queryDotted("Campaign", "res", 1)).map((symbol) => symbol.name), ["resZ"]);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("normalizes non-finite limits", async () => {
-    const { dir, tagsPath, command } = createReadtagsShim("results");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command } = createReadtagsShim(dir, "results");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       assert.equal((await backend.queryPrefix("symbol", Number.NaN)).length, 50);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("completes an alias load of exactly 10,000 lines and caches it", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-10k");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "alias-10k");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const symbols = await backend.queryPrefix("symbol", 1);
       assert.equal(symbols.length, 1);
@@ -403,155 +365,103 @@ void describe("readtags backend bounds", () => {
       // The complete load is cached; a second query does not re-run -D.
       await backend.queryPrefix("symbol", 1);
       assert.equal(readMarker(markerPath).match(/D/g)?.length, 1);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("rejects an alias load past the 10,000-line cap as incomplete", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("alias-10001");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "alias-10001");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       await assert.rejects(backend.queryPrefix("symbol", 1), /did not complete/);
-      // The active caller retries an incomplete shared load exactly once:
-      // the marker records two -D spawns and two kills.
+      // The active caller retries an incomplete load exactly once: the
+      // marker records two -D spawns and two kills.
       const marker = readMarker(markerPath);
       assert.match(marker, /K\d+/);
       assert.equal(
         marker.match(/D/g)?.length,
         2,
-        "an incomplete shared load must retry once for an active caller",
+        "an incomplete load must retry once for an active caller",
       );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 
-  void it("keeps an active caller's alias load complete when the first caller aborts", async () => {
-    // P2: the shared alias load must not belong to one caller. A and B
-    // abort in sequence while C stays active; C must receive the complete
-    // aliases and a successful query, and the shared child must survive.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
-      const aController = new AbortController();
-      const bController = new AbortController();
-
-      // A starts the shared alias load; B and C join it while it is gated.
-      const aQuery = backend.queryPrefix("aliased", 50, aController.signal);
-      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
-      const bQuery = backend.queryPrefix("aliased", 50, bController.signal);
-      const cQuery = backend.queryPrefix("aliased", 50);
-
-      // A aborts, then B aborts. C remains, so the shared load must not die.
-      aController.abort();
-      assert.deepEqual(await aQuery, []);
-      bController.abort();
-      assert.deepEqual(await bQuery, []);
-      assert.ok(!readMarker(markerPath).includes("K"), "the shared child must survive while C waits");
-
-      // Point C's query at a complete alias load, then release the gate.
-      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
-      fs.writeFileSync(markerPath + "-go", "");
-      const symbols = await cQuery;
-      assert.deepEqual(symbols.map((symbol) => symbol.name), ["Aliased"]);
-      assert.equal(symbols[0].kind, "class");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  void it("keeps an active exact caller's alias load complete when the first callers abort", async () => {
-    // P2: scanExact must use the same ref-counted shared load. A and B
-    // abort while C scans; C must not inherit the abort or scan with
-    // partial aliases.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
-      const aController = new AbortController();
-      const bController = new AbortController();
-
-      const seen: ProjectSymbol[] = [];
-      const aScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), aController.signal);
-      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
-      const bScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), bController.signal);
-      const cScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol));
-
-      aController.abort();
-      await assert.rejects(aScan, /interrupted/);
-      bController.abort();
-      await assert.rejects(bScan, /interrupted/);
-
-      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
-      fs.writeFileSync(markerPath + "-go", "");
-      await cScan;
-      assert.deepEqual(seen.map((symbol) => symbol.name), ["Aliased"]);
-      assert.equal(seen[0].kind, "class");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  void it("stops the shared alias child when every caller aborts", async () => {
-    // P2: when the final waiter leaves before the load completes, the
-    // shared subprocess is aborted so no orphan process survives.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
-      const aController = new AbortController();
-      const bController = new AbortController();
-
-      const aQuery = backend.queryPrefix("aliased", 50, aController.signal);
-      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
-      const bQuery = backend.queryPrefix("aliased", 50, bController.signal);
-
-      aController.abort();
-      assert.deepEqual(await aQuery, []);
-      bController.abort();
-      assert.deepEqual(await bQuery, []);
-
-      const marker = await waitForKill(markerPath);
-      const pid = Number.parseInt(marker.match(/P(\d+)/)![1], 10);
-      assert.throws(
-        () => process.kill(pid, 0),
-        "the shared child must be dead after the last caller aborts",
+      // The cache never keeps an incomplete load. A later caller starts
+      // a fresh load and retries it once again.
+      await assert.rejects(backend.queryPrefix("symbol", 1), /did not complete/);
+      assert.equal(
+        readMarker(markerPath).match(/D/g)?.length,
+        4,
+        "a later caller must start a fresh load",
       );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
-  void it("settles the final aborted caller only after the SIGTERM-ignoring alias child is dead", async () => {
-    // P2: a final waiter's abort must not resolve before the shared alias
-    // child is dead. A SIGTERM-ignoring child needs the SIGKILL grace, so
-    // the caller waits for the close instead of settling early.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("stubborn-alias");
-    try {
+  void it("gives an aborted caller no aliases while a concurrent caller gets the complete load", async () => {
+    // The alias load belongs to the backend, not to one caller. The first
+    // caller aborts and receives no partial map. The concurrent caller
+    // still receives the complete map from the same cached load.
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "gated-alias");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const controller = new AbortController();
 
-      const started = Date.now();
-      const query = backend.queryPrefix("aliased", 50, controller.signal);
-      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
-      controller.abort();
-      assert.deepEqual(await query, []);
+      // The first caller starts the gated alias load; the second joins it.
+      const first = backend.queryPrefix("symbol", 50, controller.signal);
+      await pollUntil(() => readMarker(markerPath).includes("P"));
+      const second = backend.queryPrefix("symbol", 1);
 
-      // The caller settled only after the SIGKILL grace. The pid must
-      // already be gone; do not poll after the caller settled.
-      assert.ok(Date.now() - started >= 150, `SIGKILL grace must elapse before settlement (took ${Date.now() - started} ms)`);
+      controller.abort();
+      assert.deepEqual(await first, [], "an aborted caller receives no partial map");
+      assert.ok(!readMarker(markerPath).includes("K"), "the load must survive the abort");
+
+      // Release the gate. The cached load completes for the second caller.
+      fs.writeFileSync(markerPath + "-go", "");
+      const symbols = await second;
+      assert.equal(symbols.length, 1);
+      assert.equal(symbols[0].name, "Symbol0");
+      assert.equal(symbols[0].kind, "class");
+      assert.equal(readMarker(markerPath).match(/D/g)?.length, 1, "both callers share one load");
+    });
+  });
+
+  void it("dispose kills a SIGTERM-ignoring alias child and stops later queries", async () => {
+    // dispose() aborts the backend lifetime signal. The in-flight alias
+    // child dies through the SIGKILL grace and every later call ends
+    // without a subprocess.
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "stubborn-alias");
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+
+      const pending = backend.queryPrefix("symbol", 50);
+      await pollUntil(() => readMarker(markerPath).includes("P"));
       const pid = Number.parseInt(readMarker(markerPath).match(/P(\d+)/)![1], 10);
-      assert.throws(
-        () => process.kill(pid, 0),
-        "the alias child must be dead when the final caller settles",
+
+      backend.dispose();
+      assert.deepEqual(await pending, [], "a disposed backend returns no results");
+
+      // The child ignores SIGTERM, so it dies at the SIGKILL grace.
+      await pollUntil(() => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }, { message: "the alias child must die after dispose()" });
+
+      const spawnsAfterDispose = readMarker(markerPath).match(/D/g)?.length;
+      assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
+      assert.deepEqual(await backend.queryDotted("Camp", "res", 50), []);
+      await assert.rejects(backend.scanExact("Symbol", () => {}), /interrupted/);
+      assert.equal(
+        readMarker(markerPath).match(/D/g)?.length,
+        spawnsAfterDispose,
+        "a disposed backend must not spawn a child",
       );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("kills a SIGTERM-ignoring child with SIGKILL after a grace period", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("no-term");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "no-term");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const started = Date.now();
       const symbols = await backend.queryPrefix("symbol", 1);
@@ -568,78 +478,73 @@ void describe("readtags backend bounds", () => {
       // The promise settled via close; the child must be dead, not a survivor.
       const pid = Number.parseInt(marker.match(/PID(\d+)/)![1], 10);
       assert.throws(() => process.kill(pid, 0), "the child must be dead after resolution");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 });
 
 void describe("readtags backend integration", { skip: !integrationAvailable }, () => {
-  void it("returns case-insensitive prefix matches", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.queryPrefix("camp", 50);
+  // One shared campaign fixture. Every test below that needs the same
+  // content reuses it, so ctags runs once instead of seven times.
+  let campaignDir = "";
+  let campaignTagsPath = "";
 
-      assert.deepEqual(
-        symbols.map((s) => s.name),
-        ["Campaign", "CampaignHelper", "CampaignViewSet"],
-      );
-      assert.ok(symbols.every((s) => s.kind === "class"));
-      assert.ok(symbols.every((s) => s.path === "campaign.py"));
-      assert.ok(symbols.every((s) => s.depth === 0));
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+  before(() => {
+    campaignDir = makeTempDir("rt-campaign-");
+    campaignTagsPath = createFixture(campaignDir, [
+      { name: "campaign.py", content: CAMPAIGN_FIXTURE },
+    ]);
+  });
+
+  after(() => {
+    if (campaignDir) removeTempDir(campaignDir);
+  });
+
+  /** Create a backend over the shared campaign fixture. */
+  function campaignBackend() {
+    return createReadtagsBackend({ tagsFilePath: campaignTagsPath, cwd: campaignDir });
+  }
+
+  void it("returns case-insensitive prefix matches", async () => {
+    const symbols = await campaignBackend().queryPrefix("camp", 50);
+
+    assert.deepEqual(
+      symbols.map((s) => s.name),
+      ["Campaign", "CampaignHelper", "CampaignViewSet"],
+    );
+    assert.ok(symbols.every((s) => s.kind === "class"));
+    assert.ok(symbols.every((s) => s.path === "campaign.py"));
+    assert.ok(symbols.every((s) => s.parentName === undefined));
   });
 
   void it("parses endLine from generated end: fields", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols: ProjectSymbol[] = [];
-      await backend.scanExact("Campaign", (symbol) => symbols.push(symbol));
+    const symbols: ProjectSymbol[] = [];
+    await campaignBackend().scanExact("Campaign", (symbol) => symbols.push(symbol));
 
-      assert.equal(symbols.length, 1);
-      assert.ok(symbols[0].endLine !== undefined);
-      assert.ok(symbols[0].endLine! >= symbols[0].line);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.equal(symbols.length, 1);
+    assert.ok(symbols[0].endLine !== undefined);
+    assert.ok(symbols[0].endLine! >= symbols[0].line);
   });
 
   void it("filters dotted queries by parent prefix and ranks exact parents first", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.queryDotted("campaign", "res", 50);
+    const symbols = await campaignBackend().queryDotted("campaign", "res", 50);
 
-      assert.deepEqual(
-        symbols.map((s) => s.name),
-        ["reservation_date", "reserve", "reset"],
-      );
-      assert.deepEqual(
-        symbols.map((s) => s.parentName),
-        ["Campaign", "Campaign", "CampaignHelper"],
-      );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.deepEqual(
+      symbols.map((s) => s.name),
+      ["reservation_date", "reserve", "reset"],
+    );
+    assert.deepEqual(
+      symbols.map((s) => s.parentName),
+      ["Campaign", "Campaign", "CampaignHelper"],
+    );
   });
 
   void it("matches dotted parents case-insensitively", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols = await backend.queryDotted("CAMP", "res", 50);
+    const symbols = await campaignBackend().queryDotted("CAMP", "res", 50);
 
-      assert.deepEqual(
-        symbols.map((s) => s.name),
-        ["reservation_date", "reserve", "reset"],
-      );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.deepEqual(
+      symbols.map((s) => s.name),
+      ["reservation_date", "reserve", "reset"],
+    );
   });
 
   void it("stops the stream at the result cap", async () => {
@@ -647,8 +552,8 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
     for (let i = 0; i < 100; i += 1) {
       manyLines.push(`class Capped${i}:`, "    pass", "");
     }
-    const { dir, tagsPath } = createFixture([{ name: "capped.py", content: manyLines.join("\n") }]);
-    try {
+    await withTempDir("rt-backend-", async (dir) => {
+      const tagsPath = createFixture(dir, [{ name: "capped.py", content: manyLines.join("\n") }]);
       // The fixture must contain more matches than the cap.
       const all = spawnSync("readtags", ["-t", tagsPath, "-e", "-n", "-p", "-i", "-", "capped"]);
       assert.equal(all.status, 0);
@@ -662,56 +567,41 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
       // A caller limit above the max cap returns at most 50 results.
       const allSymbols = await backend.queryPrefix("capped", 200);
       assert.equal(allSymbols.length, 50);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("streams an exact name", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols: ProjectSymbol[] = [];
-      await backend.scanExact("Campaign", (symbol) => symbols.push(symbol));
+    const symbols: ProjectSymbol[] = [];
+    await campaignBackend().scanExact("Campaign", (symbol) => symbols.push(symbol));
 
-      assert.equal(symbols.length, 1);
-      assert.equal(symbols[0].name, "Campaign");
-      assert.equal(symbols[0].kind, "class");
-      assert.equal(symbols[0].path, "campaign.py");
-      assert.equal(symbols[0].line, 4);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.equal(symbols.length, 1);
+    assert.equal(symbols[0].name, "Campaign");
+    assert.equal(symbols[0].kind, "class");
+    assert.equal(symbols[0].path, "campaign.py");
+    assert.equal(symbols[0].line, 4);
   });
 
   void it("visits nothing for an unknown exact name", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const symbols: ProjectSymbol[] = [];
-      await backend.scanExact("NoSuchSymbol", (symbol) => symbols.push(symbol));
-      assert.deepEqual(symbols, []);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    const symbols: ProjectSymbol[] = [];
+    await campaignBackend().scanExact("NoSuchSymbol", (symbol) => symbols.push(symbol));
+    assert.deepEqual(symbols, []);
   });
 
   void it("streams more than 50 exact records through the visitor", { skip: !readtagsPresent }, async () => {
     // P1: the backend must not cap exact scans at 50 results. A fixture
     // with 60 identical names must deliver all 60 to the visitor while
     // the backend itself retains none.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rt-scan-60-"));
-    const tagsPath = path.join(dir, "tags");
-    const lines = [
-      "!_TAG_FILE_FORMAT\t2\t/extended format/",
-      "!_TAG_FILE_SORTED\t2\t/0=unsorted, 1=sorted, 2=foldcase/",
-    ];
-    for (let i = 1; i <= 60; i += 1) {
-      lines.push(`seed\tsrc/seed.ts\t/^def seed():$/;"\tkind:function\tline:${i}\tlanguage:TypeScript`);
-    }
-    fs.writeFileSync(tagsPath, lines.join("\n") + "\n");
+    await withTempDir("rt-scan-60-", async (dir) => {
+      const tagsPath = path.join(dir, "tags");
+      const lines = [
+        "!_TAG_FILE_FORMAT\t2\t/extended format/",
+        "!_TAG_FILE_SORTED\t2\t/0=unsorted, 1=sorted, 2=foldcase/",
+      ];
+      for (let i = 1; i <= 60; i += 1) {
+        lines.push(`seed\tsrc/seed.ts\t/^def seed():$/;"\tkind:function\tline:${i}\tlanguage:TypeScript`);
+      }
+      fs.writeFileSync(tagsPath, lines.join("\n") + "\n");
 
-    try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
       const seen: ProjectSymbol[] = [];
       await backend.scanExact("seed", (symbol) => seen.push(symbol));
@@ -719,31 +609,28 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
       assert.equal(seen.length, 60);
       assert.ok(seen.every((s) => s.name === "seed"));
       assert.equal(new Set(seen.map((s) => s.line)).size, 60);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   void it("rejects an exact scan that hits the scanned-line cap", async () => {
     // P1: when the stream stops before normal EOF, the scan must reject
     // as incomplete instead of returning partial results.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("scanned");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "scanned");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const started = Date.now();
       await assert.rejects(backend.scanExact("symbol", () => {}), /did not complete/);
       assert.ok(Date.now() - started < 2_000);
-      assert.match(await waitForKill(markerPath), /K\d+/);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.match(readMarker(markerPath), /K\d+/);
+    });
   });
 
   void it("rejects when the scan visitor throws and kills the child", async () => {
     // P1: a visitor exception must not escape the EventEmitter callback
     // or crash Node; the scan rejects and the child is cleaned up.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "results");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const boom = new Error("visitor boom");
       await assert.rejects(
@@ -752,17 +639,16 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
         }),
         (error: unknown) => error === boom,
       );
-      assert.match(await waitForKill(markerPath), /K\d+/);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.match(readMarker(markerPath), /K\d+/);
+    });
   });
 
   void it("rejects when the scan visitor throws a falsy value and kills the child", async () => {
     // P1: a falsy thrown value must still reject the scan, not resolve
     // a partial scan as if it completed. The child is killed and cleaned up.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("results");
-    try {
+    await withTempDir("rt-shim-", async (dir) => {
+      const { tagsPath, command, markerPath } = createReadtagsShim(dir, "results");
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       for (const falsy of [undefined, null]) {
         await assert.rejects(
@@ -772,22 +658,15 @@ void describe("readtags backend integration", { skip: !integrationAvailable }, (
           (error: unknown) => error === falsy,
         );
       }
-      assert.match(await waitForKill(markerPath), /K\d+/);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      await pollUntil(() => readMarker(markerPath).includes("K"));
+      assert.match(readMarker(markerPath), /K\d+/);
+    });
   });
 
   void it("returns immediately when the signal is already aborted", async () => {
-    const { dir, tagsPath } = createFixture([{ name: "campaign.py", content: CAMPAIGN_FIXTURE }]);
-    try {
-      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir });
-      const controller = new AbortController();
-      controller.abort();
-      const symbols = await backend.queryPrefix("camp", 50, controller.signal);
-      assert.deepEqual(symbols, []);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    const controller = new AbortController();
+    controller.abort();
+    const symbols = await campaignBackend().queryPrefix("camp", 50, controller.signal);
+    assert.deepEqual(symbols, []);
   });
 });

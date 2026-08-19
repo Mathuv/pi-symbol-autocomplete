@@ -12,7 +12,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type {
   ExtensionAPI,
@@ -26,6 +25,17 @@ import type {
 
 // We import the default export (the extension factory)
 import symbolAutocompleteExtension from "./index.ts";
+import {
+  createCommandContext,
+  createFakeReadtagsBackend,
+  createMockPi,
+  deferred,
+  pollUntil,
+  promptEvent,
+  readStatusLine,
+  spliceCompletionProvider,
+  withTempDir,
+} from "./test-support.ts";
 
 // ── Helper: create a mock tags manager ──────────────────────────────
 
@@ -48,83 +58,6 @@ function createMockManager(overrides?: {
     getStatus: () => status,
     shutdown: async () => {},
   };
-}
-
-// ── Helper: create a mock ExtensionAPI ──────────────────────────────
-
-interface MockExtensionAPI extends ExtensionAPI {
-  commands: Map<string, { handler: (...args: unknown[]) => unknown }>;
-  handlers: Map<string, (...args: unknown[]) => unknown>;
-  notifyCalls: Array<{ message: string; type: string }>;
-}
-
-function createMockPi(executor: Executor = async () => ({ code: 0, stdout: "", stderr: "", killed: false })): MockExtensionAPI {
-  const commands = new Map();
-  const handlers = new Map();
-  const notifyCalls: Array<{ message: string; type: string }> = [];
-
-  const pi = {
-    commands,
-    handlers,
-    notifyCalls,
-    on: (event: string, handler: (...args: unknown[]) => unknown) => {
-      handlers.set(event, handler);
-    },
-    registerCommand: (name: string, opts: { handler: (...args: unknown[]) => unknown }) => {
-      commands.set(name, opts.handler);
-    },
-    registerTool: () => {},
-    registerShortcut: () => {},
-    registerFlag: () => {},
-    getFlag: () => undefined,
-    registerMessageRenderer: () => {},
-    sendMessage: () => {},
-    sendUserMessage: () => {},
-    appendEntry: () => {},
-    setSessionName: () => {},
-    getSessionName: () => undefined,
-    setLabel: () => {},
-    exec: executor,
-    getActiveTools: () => [],
-    getAllTools: () => [],
-    setActiveTools: () => {},
-    getCommands: () => [],
-    setModel: async () => false,
-    getThinkingLevel: () => "off" as const,
-    setThinkingLevel: () => {},
-  };
-
-  return pi as unknown as MockExtensionAPI;
-}
-
-// ── Helper: create a mock ExtensionCommandContext ───────────────────
-
-function createMockCtx(overrides?: {
-  cwd?: string;
-  ui?: {
-    notify?: (message: string, type: string) => void;
-    addAutocompleteProvider?: (factory: (current: unknown) => unknown) => void;
-  };
-}): ExtensionCommandContext {
-  const notifyCalls: Array<{ message: string; type: string }> = [];
-  const ctx = {
-    cwd: overrides?.cwd ?? "/test/project",
-    ui: {
-      notify: overrides?.ui?.notify ?? ((message: string, type: string) => {
-        notifyCalls.push({ message, type });
-      }),
-      addAutocompleteProvider: overrides?.ui?.addAutocompleteProvider ?? (() => {}),
-    },
-    exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
-    waitForIdle: async () => {},
-    newSession: async () => ({ cancelled: false }),
-    fork: async () => ({ cancelled: false }),
-    navigateTree: async () => ({ cancelled: false }),
-    switchSession: async () => ({ cancelled: false }),
-    reload: async () => {},
-  };
-
-  return Object.assign(ctx, { _notifyCalls: notifyCalls }) as unknown as ExtensionCommandContext;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -164,8 +97,8 @@ void describe("symbol autocomplete extension", () => {
       const handler = createRescanHandler(() => manager);
 
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const ctx = createCommandContext({
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       await handler("", ctx);
@@ -196,8 +129,8 @@ void describe("symbol autocomplete extension", () => {
       const handler = createRescanHandler(() => manager);
 
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const ctx = createCommandContext({
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       await handler("", ctx);
@@ -213,8 +146,8 @@ void describe("symbol autocomplete extension", () => {
       const handler = createRescanHandler(() => null);
 
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const ctx = createCommandContext({
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       await handler("", ctx);
@@ -244,8 +177,8 @@ void describe("symbol autocomplete extension", () => {
       const handler = createStatusHandler(() => manager);
 
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const ctx = createCommandContext({
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       await handler("", ctx);
@@ -268,8 +201,8 @@ void describe("symbol autocomplete extension", () => {
       const handler = createStatusHandler(() => null);
 
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const ctx = createCommandContext({
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       await handler("", ctx);
@@ -311,21 +244,21 @@ void describe("symbol autocomplete extension", () => {
 
       // Start a session. The index build starts but is not yet complete.
       // We need an executor that hangs so the index is "building"
-      const sessionCtx = createMockCtx({
-        ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+      const sessionCtx = createCommandContext({
         cwd: "/test/project",
+        notify: (msg, type) => notifyCalls.push({ message: msg, type }),
       });
 
       // Fire session_start
       sessionStartHandler?.({}, sessionCtx as any);
 
-      // Let the event loop tick to start the async tags build
-      await new Promise((r) => setTimeout(r, 10));
+      // Wait for the async tags build to reach the readtags probe.
+      await pollUntil(() => execCalls.length > 0);
       assert.equal(execCalls[0]?.command, "readtags");
 
       // Fire before_agent_start while build is in-flight
       const turnResult = await beforeAgentStartHandler?.(
-        { prompt: "Use #MyService", ...createPromptEventPartial() },
+        promptEvent("Use #MyService"),
         sessionCtx as any,
       );
 
@@ -340,9 +273,8 @@ void describe("symbol autocomplete extension", () => {
 
     void it("does not burn warnedEngine on healthy first turn; warns exactly once after degradation", async () => {
       const allNotifyCalls: Array<{ message: string; type: string }> = [];
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-ix-"));
+      await withTempDir("sym-ix-", async (tmpDir) => {
 
-      try {
         // Mock executor: readtags probe succeeds; ctags starts healthy and later fails
         let ctagsFails = false;
 
@@ -378,20 +310,20 @@ void describe("symbol autocomplete extension", () => {
         assert.ok(sessionStartHandler);
         assert.ok(beforeAgentStartHandler);
 
-        const sessionCtx = createMockCtx({
-          ui: { notify: (msg, type) => allNotifyCalls.push({ message: msg, type }) },
+        const sessionCtx = createCommandContext({
           cwd: tmpDir,
+          notify: (msg, type) => allNotifyCalls.push({ message: msg, type }),
         });
 
         // ── Session start: generates tags with healthy ctags ────────
         sessionStartHandler?.({}, sessionCtx as any);
 
-        // Wait for async tags ensure to complete
-        await new Promise((r) => setTimeout(r, 50));
+        // Wait for the async tags ensure to settle.
+        await pollUntil(async () => !(await readStatusLine(pi, tmpDir)).includes("In flight: true"));
 
         // ── First turn: healthy engine, no engine warning ───────────
         const turn1Result = await beforeAgentStartHandler?.(
-          { prompt: "Hello world", ...createPromptEventPartial() },
+          promptEvent("Hello world"),
           sessionCtx as any,
         );
 
@@ -417,14 +349,14 @@ void describe("symbol autocomplete extension", () => {
 
         await rescanHandler("", sessionCtx as any);
 
-        // Wait for async regeneration to complete
-        await new Promise((r) => setTimeout(r, 50));
+        // Wait for the failed regeneration to settle the status.
+        await pollUntil(async () => (await readStatusLine(pi, tmpDir)).includes("Engine: none"));
 
         // ── Second turn: engine none, exactly one warning ───────────
         const warningsBeforeTurn2 = allNotifyCalls.filter(engineWarningsFilter).length;
 
         const turn2Result = await beforeAgentStartHandler?.(
-          { prompt: "Hello world", ...createPromptEventPartial() },
+          promptEvent("Hello world"),
           sessionCtx as any,
         );
 
@@ -446,7 +378,7 @@ void describe("symbol autocomplete extension", () => {
 
         // ── Third turn: no additional engine warning (non-spam) ─────
         const turn3Result = await beforeAgentStartHandler?.(
-          { prompt: "Hello world", ...createPromptEventPartial() },
+          promptEvent("Hello world"),
           sessionCtx as any,
         );
 
@@ -458,17 +390,14 @@ void describe("symbol autocomplete extension", () => {
           0,
           "no additional engine warning on subsequent turns",
         );
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
+      });
     });
 
     void it("fails open when the backend lookup rejects", async () => {
       // A backend rejection at the extension boundary must not crash Pi:
       // warn once per session and proceed without injection.
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-bnd-"));
+      await withTempDir("sym-bnd-", async (tmpDir) => {
 
-      try {
         // ctags must write a real tags file so the engine is usable and
         // resolution actually reaches the (rejecting) backend.
         const executor: Executor = async (command: string, args: string[]) => {
@@ -487,13 +416,12 @@ void describe("symbol autocomplete extension", () => {
         };
 
         const pi = createMockPi(executor);
-        const createBackend = () => ({
-          queryPrefix: async () => [],
-          queryDotted: async () => [],
-          scanExact: async () => {
-            throw new Error("readtags exploded");
-          },
-        });
+        const createBackend = () =>
+          createFakeReadtagsBackend({
+            scanExact: async () => {
+              throw new Error("readtags exploded");
+            },
+          });
         symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
 
         const sessionStartHandler = pi.handlers.get("session_start") as
@@ -506,16 +434,16 @@ void describe("symbol autocomplete extension", () => {
         assert.ok(beforeAgentStartHandler);
 
         const notifyCalls: Array<{ message: string; type: string }> = [];
-        const sessionCtx = createMockCtx({
+        const sessionCtx = createCommandContext({
           cwd: tmpDir,
-          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+          notify: (msg, type) => notifyCalls.push({ message: msg, type }),
         });
 
         sessionStartHandler?.({}, sessionCtx as any);
-        await new Promise((r) => setTimeout(r, 50));
+        await pollUntil(async () => !(await readStatusLine(pi, tmpDir)).includes("In flight: true"));
 
         const result = await beforeAgentStartHandler?.(
-          { ...createPromptEventPartial(), prompt: "Use #MyService" },
+          promptEvent("Use #MyService"),
           sessionCtx as any,
         );
 
@@ -528,7 +456,7 @@ void describe("symbol autocomplete extension", () => {
 
         // Second turn: no additional warning (non-spam).
         await beforeAgentStartHandler?.(
-          { ...createPromptEventPartial(), prompt: "Use #MyService" },
+          promptEvent("Use #MyService"),
           sessionCtx as any,
         );
         assert.equal(
@@ -536,220 +464,126 @@ void describe("symbol autocomplete extension", () => {
           1,
           "no additional backend-failure warning",
         );
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
-    });
-
-    void it("fails open when the resolver total deadline aborts the scans", { timeout: 10_000 }, async () => {
-      // The backend hangs until the resolver's shared signal aborts at the
-      // 5 s total deadline. The extension must warn once, inject nothing,
-      // and bound the resolution time to one deadline, not N × 5 s.
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-dl-"));
-
-      try {
-        const executor: Executor = async (command: string) => {
-          if (command === "readtags") {
-            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
-          }
-          if (command === "ctags") {
-            fs.writeFileSync(
-              path.join(tmpDir, "tags"),
-              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
-            );
-            return { code: 0, stdout: "", stderr: "", killed: false };
-          }
-          return { code: 0, stdout: "", stderr: "", killed: false };
-        };
-
-        const pi = createMockPi(executor);
-        const createBackend = () => ({
-          queryPrefix: async () => [],
-          queryDotted: async () => [],
-          scanExact: async (_name: string, _onSymbol: unknown, signal?: AbortSignal) => {
-            if (!signal) throw new Error("resolver must pass its total-deadline signal");
-            await new Promise((_resolve, reject) => {
-              signal.addEventListener(
-                "abort",
-                () => reject(new Error("resolver deadline")),
-                { once: true },
-              );
-            });
-          },
-        });
-        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
-
-        const sessionStartHandler = pi.handlers.get("session_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => void)
-          | undefined;
-        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
-          | undefined;
-        assert.ok(sessionStartHandler);
-        assert.ok(beforeAgentStartHandler);
-
-        const notifyCalls: Array<{ message: string; type: string }> = [];
-        const sessionCtx = createMockCtx({
-          cwd: tmpDir,
-          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
-        });
-
-        sessionStartHandler?.({}, sessionCtx as any);
-        await new Promise((r) => setTimeout(r, 50));
-
-        const started = Date.now();
-        const result = await beforeAgentStartHandler?.(
-          { ...createPromptEventPartial(), prompt: "#MyService\n#OtherA\n#OtherB" },
-          sessionCtx as any,
-        );
-        const elapsed = Date.now() - started;
-
-        assert.equal(result, undefined, "a deadline abort must skip injection");
-        const failureWarnings = notifyCalls.filter((c) => c.message.includes("lookup failed"));
-        assert.equal(failureWarnings.length, 1, "warn exactly once");
-        assert.equal(failureWarnings[0].type, "warning");
-        assert.ok(elapsed < 5_500, `the total deadline must bound resolution (took ${elapsed} ms)`);
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
+      });
     });
 
     void it("recreates manager and backend per session cwd without stale closures", async () => {
-      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-a-"));
-      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-b-"));
-
-      try {
-        // ctags writes the tags file; the probe must succeed.
-        const ctagsTargets: string[] = [];
-        const executor: Executor = async (command: string, args: string[]) => {
-          if (command === "readtags") {
-            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
-          }
-          if (command === "ctags") {
-            const target = args[args.indexOf("-f") + 1];
-            ctagsTargets.push(target);
-            fs.writeFileSync(
-              target,
-              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
-            );
+      await withTempDir("sym-sess-a-", async (dirA) => {
+        await withTempDir("sym-sess-b-", async (dirB) => {
+          // ctags writes the tags file; the probe must succeed.
+          const ctagsTargets: string[] = [];
+          const executor: Executor = async (command: string, args: string[]) => {
+            if (command === "readtags") {
+              return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+            }
+            if (command === "ctags") {
+              const target = args[args.indexOf("-f") + 1];
+              ctagsTargets.push(target);
+              fs.writeFileSync(
+                target,
+                "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
+              );
+              return { code: 0, stdout: "", stderr: "", killed: false };
+            }
             return { code: 0, stdout: "", stderr: "", killed: false };
-          }
-          return { code: 0, stdout: "", stderr: "", killed: false };
-        };
-
-        const pi = createMockPi(executor);
-
-        // Track every backend instance and which one served queries and scans.
-        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[]; scans: string[] }> = [];
-        const providerFactories: Array<(current: unknown) => unknown> = [];
-        const createBackend = (tagsFilePath: string, cwd: string) => {
-          const record = { tagsFilePath, cwd, queries: [] as string[], scans: [] as string[] };
-          backends.push(record);
-          return {
-            queryPrefix: async (query: string) => {
-              record.queries.push(query);
-              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
-            },
-            queryDotted: async () => [],
-            scanExact: async (name: string, onSymbol: (symbol: { name: string; kind: string; path: string; line: number }) => void) => {
-              record.scans.push(name);
-              onSymbol({ name, kind: "class", path: "service.ts", line: 1 });
-            },
           };
-        };
-        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
 
-        const sessionStartHandler = pi.handlers.get("session_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => void)
-          | undefined;
-        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
-          | undefined;
-        assert.ok(sessionStartHandler);
-        assert.ok(beforeAgentStartHandler);
+          const pi = createMockPi(executor);
 
-        // Start session A, then a second session in a different cwd.
-        const makeSessionCtx = (cwd: string) =>
-          createMockCtx({
-            cwd,
-            ui: {
-              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
-                providerFactories.push(factory);
+          // Track every backend instance and which one served queries and scans.
+          const backends: Array<{
+            tagsFilePath: string;
+            cwd: string;
+            backend: ReturnType<typeof createFakeReadtagsBackend>;
+          }> = [];
+          const providerFactories: Array<(current: unknown) => unknown> = [];
+          const createBackend = (tagsFilePath: string, cwd: string) => {
+            const backend = createFakeReadtagsBackend({
+              queryPrefix: async () => [
+                { name: "MyService", kind: "class", path: "service.ts", line: 1 },
+              ],
+              scanExact: async (name, onSymbol) => {
+                onSymbol({ name, kind: "class", path: "service.ts", line: 1 });
               },
-            },
+            });
+            backends.push({ tagsFilePath, cwd, backend });
+            return backend;
+          };
+          symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+          const sessionStartHandler = pi.handlers.get("session_start") as
+            | ((event: unknown, ctx: ExtensionCommandContext) => void)
+            | undefined;
+          const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
+            | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
+            | undefined;
+          assert.ok(sessionStartHandler);
+          assert.ok(beforeAgentStartHandler);
+
+          // Start session A, then a second session in a different cwd.
+          const makeSessionCtx = (cwd: string) =>
+            createCommandContext({
+              cwd,
+              addAutocompleteProvider: (factory) => {
+                  providerFactories.push(factory);
+                },
+            });
+          sessionStartHandler?.({}, makeSessionCtx(dirA));
+          await pollUntil(async () => !(await readStatusLine(pi, dirA)).includes("In flight: true"));
+          sessionStartHandler?.({}, makeSessionCtx(dirB));
+          await pollUntil(async () => !(await readStatusLine(pi, dirB)).includes("In flight: true"));
+
+          assert.equal(backends.length, 2, "one backend per session");
+          assert.equal(backends[0].cwd, dirA);
+          assert.equal(backends[1].cwd, dirB);
+          assert.equal(backends[1].tagsFilePath, path.join(dirB, "tags"));
+          assert.equal(providerFactories.length, 2, "one autocomplete provider per session");
+
+          // P2: the provider registered for the second session must query the
+          // second session's backend, never the first session's.
+          const provider = providerFactories[1](spliceCompletionProvider()) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
+          const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
+            signal: AbortSignal.timeout(1000),
           });
-        sessionStartHandler?.({}, makeSessionCtx(dirA));
-        await new Promise((r) => setTimeout(r, 50));
-        sessionStartHandler?.({}, makeSessionCtx(dirB));
-        await new Promise((r) => setTimeout(r, 50));
+          assert.ok(suggestions, "second-session provider must return suggestions");
+          assert.equal(suggestions.prefix, "#MySer");
+          assert.deepEqual(backends[0].backend.queries, [], "provider must not query the session A backend");
+          assert.deepEqual(backends[1].backend.queries, ["MySer"], "provider must query the session B backend");
 
-        assert.equal(backends.length, 2, "one backend per session");
-        assert.equal(backends[0].cwd, dirA);
-        assert.equal(backends[1].cwd, dirB);
-        assert.equal(backends[1].tagsFilePath, path.join(dirB, "tags"));
-        assert.equal(providerFactories.length, 2, "one autocomplete provider per session");
+          // Write the file the mock symbol path points at, so injection succeeds.
+          fs.writeFileSync(path.join(dirB, "service.ts"), "class MyService {}\n");
 
-        // P2: the provider registered for the second session must query the
-        // second session's backend, never the first session's.
-        const provider = providerFactories[1]({
-          async getSuggestions() {
-            return null;
-          },
-          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
-            const line = lines[cursorLine] ?? "";
-            const start = cursorCol - prefix.length;
-            const nextLines = [...lines];
-            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
-            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
-          },
-          shouldTriggerFileCompletion() {
-            return true;
-          },
-        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
-        const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
-          signal: AbortSignal.timeout(1000),
+          const notifyCalls: Array<{ message: string; type: string }> = [];
+          const ctxB = createCommandContext({
+            cwd: dirB,
+            notify: (msg, type) => notifyCalls.push({ message: msg, type }),
+          });
+
+          const result = await beforeAgentStartHandler?.(
+            promptEvent("Use #MyService"),
+            ctxB as any,
+          );
+
+          // The turn must resolve through the backend of the current session.
+          assert.ok(result !== undefined, "should inject via the current backend");
+          assert.deepEqual(backends[0].backend.scans, [], "no scan on the stale session A backend");
+          assert.deepEqual(backends[1].backend.scans, ["MyService"]);
+
+          // Command handlers must use the current session's manager.
+          const rescanHandler = pi.commands.get("rescan-symbols") as
+            | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
+            | undefined;
+          assert.ok(rescanHandler);
+          await rescanHandler("", ctxB as any);
+          await pollUntil(async () => !(await readStatusLine(pi, dirB)).includes("In flight: true"));
+
+          assert.equal(
+            ctagsTargets[ctagsTargets.length - 1].startsWith(dirB + path.sep),
+            true,
+            "rescan must regenerate the current session's tags file",
+          );
         });
-        assert.ok(suggestions, "second-session provider must return suggestions");
-        assert.equal(suggestions.prefix, "#MySer");
-        assert.deepEqual(backends[0].queries, [], "provider must not query the session A backend");
-        assert.deepEqual(backends[1].queries, ["MySer"], "provider must query the session B backend");
-
-        // Write the file the mock symbol path points at, so injection succeeds.
-        fs.writeFileSync(path.join(dirB, "service.ts"), "class MyService {}\n");
-
-        const notifyCalls: Array<{ message: string; type: string }> = [];
-        const ctxB = createMockCtx({
-          cwd: dirB,
-          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
-        });
-
-        const result = await beforeAgentStartHandler?.(
-          { ...createPromptEventPartial(), prompt: "Use #MyService" },
-          ctxB as any,
-        );
-
-        // The turn must resolve through the backend of the current session.
-        assert.ok(result !== undefined, "should inject via the current backend");
-        assert.deepEqual(backends[0].scans, [], "no scan on the stale session A backend");
-        assert.deepEqual(backends[1].scans, ["MyService"]);
-
-        // Command handlers must use the current session's manager.
-        const rescanHandler = pi.commands.get("rescan-symbols") as
-          | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
-          | undefined;
-        assert.ok(rescanHandler);
-        await rescanHandler("", ctxB as any);
-        await new Promise((r) => setTimeout(r, 50));
-
-        assert.equal(
-          ctagsTargets[ctagsTargets.length - 1].startsWith(dirB + path.sep),
-          true,
-          "rescan must regenerate the current session's tags file",
-        );
-      } finally {
-        fs.rmSync(dirA, { recursive: true, force: true });
-        fs.rmSync(dirB, { recursive: true, force: true });
-      }
+      });
     });
 
     void it("reuses one manager and backend for a same-cwd restart while the build runs", async () => {
@@ -757,9 +591,8 @@ void describe("symbol autocomplete extension", () => {
       // reuse the current manager and backend. Its ensure() joins the
       // in-flight build, so a second ctags process never runs and no
       // older finalizer can overwrite newer tags.
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-same-"));
+      await withTempDir("sym-same-", async (tmpDir) => {
 
-      try {
         // Gate the first ctags generation until both session starts fired.
         let releaseCtags: () => void = () => {};
         const ctagsGate = new Promise<void>((resolve) => { releaseCtags = resolve; });
@@ -786,19 +619,20 @@ void describe("symbol autocomplete extension", () => {
         };
 
         const pi = createMockPi(executor);
-        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[] }> = [];
+        const backends: Array<{
+          tagsFilePath: string;
+          cwd: string;
+          backend: ReturnType<typeof createFakeReadtagsBackend>;
+        }> = [];
         const providerFactories: Array<(current: unknown) => unknown> = [];
         const createBackend = (tagsFilePath: string, cwd: string) => {
-          const record = { tagsFilePath, cwd, queries: [] as string[] };
-          backends.push(record);
-          return {
-            queryPrefix: async (query: string) => {
-              record.queries.push(query);
-              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
-            },
-            queryDotted: async () => [],
-            scanExact: async () => {},
-          };
+          const backend = createFakeReadtagsBackend({
+            queryPrefix: async () => [
+              { name: "MyService", kind: "class", path: "service.ts", line: 1 },
+            ],
+          });
+          backends.push({ tagsFilePath, cwd, backend });
+          return backend;
         };
         symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
 
@@ -808,13 +642,11 @@ void describe("symbol autocomplete extension", () => {
         assert.ok(sessionStartHandler);
 
         const makeSessionCtx = (cwd: string) =>
-          createMockCtx({
+          createCommandContext({
             cwd,
-            ui: {
-              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
+            addAutocompleteProvider: (factory) => {
                 providerFactories.push(factory);
               },
-            },
           });
 
         // First session start: the tags build starts and is gated on ctags.
@@ -826,7 +658,7 @@ void describe("symbol autocomplete extension", () => {
 
         // Release the build. The reused manager's ensure() must coalesce.
         releaseCtags();
-        await waitForTagsFile(path.join(tmpDir, "tags"));
+        await pollUntil(async () => !(await readStatusLine(pi, tmpDir)).includes("In flight: true"));
 
         assert.equal(ctagsCalls, 1, "both session starts share one ctags process");
         assert.equal(backends.length, 1, "the same-path restart reuses the backend");
@@ -836,27 +668,13 @@ void describe("symbol autocomplete extension", () => {
         assert.match(fs.readFileSync(path.join(tmpDir, "tags"), "utf8"), /MyService/);
 
         // The second editor's provider must query the reused backend.
-        const provider = providerFactories[1]({
-          async getSuggestions() {
-            return null;
-          },
-          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
-            const line = lines[cursorLine] ?? "";
-            const start = cursorCol - prefix.length;
-            const nextLines = [...lines];
-            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
-            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
-          },
-          shouldTriggerFileCompletion() {
-            return true;
-          },
-        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
+        const provider = providerFactories[1](spliceCompletionProvider()) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
         const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
           signal: AbortSignal.timeout(1000),
         });
         assert.ok(suggestions, "the second provider must return suggestions");
         assert.equal(suggestions.prefix, "#MySer");
-        assert.deepEqual(backends[0].queries, ["MySer"], "the second provider must query the reused backend");
+        assert.deepEqual(backends[0].backend.queries, ["MySer"], "the second provider must query the reused backend");
 
         // Command hooks must use the reused current manager.
         const statusHandler = pi.commands.get("symbol-autocomplete-status") as
@@ -864,9 +682,9 @@ void describe("symbol autocomplete extension", () => {
           | undefined;
         assert.ok(statusHandler);
         const statusNotify: Array<{ message: string; type: string }> = [];
-        const statusCtx = createMockCtx({
+        const statusCtx = createCommandContext({
           cwd: tmpDir,
-          ui: { notify: (msg, type) => statusNotify.push({ message: msg, type }) },
+          notify: (msg, type) => statusNotify.push({ message: msg, type }),
         });
         await statusHandler("", statusCtx as any);
         assert.equal(statusNotify.length, 1);
@@ -874,26 +692,17 @@ void describe("symbol autocomplete extension", () => {
           statusNotify[0].message.includes(path.resolve(tmpDir, "tags")),
           "status must report the reused manager's tags path",
         );
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
+      });
     });
 
-    void it("old manager never publishes after session_shutdown; a new instance publishes and serves new state", async () => {
-      // Real Pi lifecycle: pi emits and awaits session_shutdown, tears down
-      // the old runtime, then starts the new extension instance. The old
-      // manager must never publish its build, even when the executor
-      // ignores the abort signal and returns code 0 during shutdown.
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-xfact-"));
-
-      try {
-        // First ctags run is gated until shutdown; it ignores the signal
-        // and returns code 0. The second run (new instance) succeeds.
+    void it("session_shutdown disposes the backend and awaits the manager; a new instance publishes", async () => {
+      // Pi awaits session_shutdown, tears down the old runtime, then
+      // starts the replacement instance. The handler must dispose the
+      // backend and wait for the manager, so no old build publishes.
+      await withTempDir("sym-xfact-", async (tmpDir) => {
+        const firstCtagsGate = deferred();
+        const firstCtagsStarted = deferred();
         let ctagsRuns = 0;
-        let releaseFirstCtags: () => void = () => {};
-        const firstCtagsGate = new Promise<void>((resolve) => { releaseFirstCtags = resolve; });
-        let firstCtagsStarted: () => void = () => {};
-        const firstCtagsStartedPromise = new Promise<void>((resolve) => { firstCtagsStarted = resolve; });
 
         const executor: Executor = async (command: string, args: string[]) => {
           if (command === "readtags") {
@@ -903,8 +712,9 @@ void describe("symbol autocomplete extension", () => {
             ctagsRuns += 1;
             const target = args[args.indexOf("-f") + 1];
             if (ctagsRuns === 1) {
-              firstCtagsStarted();
-              await firstCtagsGate;
+              firstCtagsStarted.resolve();
+              await firstCtagsGate.promise;
+              // This executor ignores the abort signal and reports success.
               fs.writeFileSync(target, "OLD_MANAGER_PUBLISH\n");
               return { code: 0, stdout: "", stderr: "", killed: false };
             }
@@ -914,56 +724,34 @@ void describe("symbol autocomplete extension", () => {
           return { code: 1, stdout: "", stderr: "", killed: false };
         };
 
-        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[] }> = [];
-        const providerFactories: Array<(current: unknown) => unknown> = [];
-        const createBackend = (tagsFilePath: string, cwd: string) => {
-          const record = { tagsFilePath, cwd, queries: [] as string[] };
-          backends.push(record);
-          return {
-            queryPrefix: async (query: string) => {
-              record.queries.push(query);
-              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
-            },
-            queryDotted: async () => [],
-            scanExact: async () => {},
-          };
+        const backends: Array<ReturnType<typeof createFakeReadtagsBackend>> = [];
+        const createBackend = () => {
+          const backend = createFakeReadtagsBackend();
+          backends.push(backend);
+          return backend;
         };
-        const makeSessionCtx = () =>
-          createMockCtx({
-            cwd: tmpDir,
-            ui: {
-              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
-                providerFactories.push(factory);
-              },
-            },
-          });
 
-        // ── Old extension instance: gated tags build ────────────────
+        // ── Old instance: a gated tags build ────────────────────────
         const pi1 = createMockPi(executor);
         symbolAutocompleteExtension(pi1 as unknown as ExtensionAPI, { createBackend });
-        const sessionStart1 = pi1.handlers.get("session_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => void)
-          | undefined;
-        const sessionShutdown = pi1.handlers.get("session_shutdown") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<void>)
-          | undefined;
-        assert.ok(sessionStart1);
-        assert.ok(sessionShutdown);
-
-        sessionStart1?.({}, makeSessionCtx());
-        await firstCtagsStartedPromise;
-        assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false);
+        pi1.handlers.get("session_start")!({}, createCommandContext({ cwd: tmpDir }));
+        await firstCtagsStarted.promise;
 
         // ── Pi teardown: dispatch and await session_shutdown ────────
-        const shutdownPromise = sessionShutdown({}, makeSessionCtx());
-        releaseFirstCtags(); // the executor ignores the signal; returns code 0
+        const shutdownPromise = pi1.handlers.get("session_shutdown")!(
+          {},
+          createCommandContext({ cwd: tmpDir }),
+        );
+        assert.equal(backends[0].state.disposals, 1, "shutdown must dispose the backend");
+        firstCtagsGate.resolve();
         await shutdownPromise;
 
-        // The obsolete manager must never publish, and no temp remains.
+        // The handler awaited the manager, so the old build settled and
+        // published nothing.
         assert.equal(
           fs.existsSync(path.join(tmpDir, "tags")),
           false,
-          "old manager must not publish after shutdown",
+          "the old manager must not publish after shutdown",
         );
         assert.deepEqual(
           fs.readdirSync(tmpDir).filter((f) => f.startsWith(".tags.tmp-")),
@@ -971,66 +759,20 @@ void describe("symbol autocomplete extension", () => {
           "shutdown must clean the old manager's temp file",
         );
 
-        // ── New extension instance (real Pi replacement) ────────────
+        // ── A fresh instance publishes on its own ───────────────────
         const pi2 = createMockPi(executor);
         symbolAutocompleteExtension(pi2 as unknown as ExtensionAPI, { createBackend });
-        const sessionStart2 = pi2.handlers.get("session_start") as
-          | ((event: unknown, ctx: ExtensionCommandContext) => void)
-          | undefined;
-        assert.ok(sessionStart2);
-        sessionStart2?.({}, makeSessionCtx());
-        await waitForTagsFile(path.join(tmpDir, "tags"));
+        pi2.handlers.get("session_start")!({}, createCommandContext({ cwd: tmpDir }));
+        await pollUntil(async () => !(await readStatusLine(pi2, tmpDir)).includes("In flight: true"));
 
-        const published = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
-        assert.match(published, /NEW_MANAGER_PUBLISH/);
-        assert.ok(!published.includes("OLD_MANAGER_PUBLISH"), "the old build must never reach the live file");
-        assert.equal(ctagsRuns, 2, "one ctags run per factory instance");
-        assert.equal(backends.length, 2, "one backend per factory instance");
-
-        // ── Commands use the new manager's state ────────────────────
-        const statusHandler = pi2.commands.get("symbol-autocomplete-status") as
-          | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
-          | undefined;
-        assert.ok(statusHandler);
-        const statusNotify: Array<{ message: string; type: string }> = [];
-        await statusHandler("", createMockCtx({
-          cwd: tmpDir,
-          ui: { notify: (msg, type) => statusNotify.push({ message: msg, type }) },
-        }) as any);
-        assert.equal(statusNotify.length, 1);
-        assert.match(statusNotify[0].message, /Engine: generated/);
-        assert.ok(statusNotify[0].message.includes(path.resolve(tmpDir, "tags")));
-
-        // ── The new provider queries the new backend ────────────────
-        const provider = providerFactories[1]({
-          async getSuggestions() {
-            return null;
-          },
-          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
-            const line = lines[cursorLine] ?? "";
-            const start = cursorCol - prefix.length;
-            const nextLines = [...lines];
-            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
-            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
-          },
-          shouldTriggerFileCompletion() {
-            return true;
-          },
-        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
-        const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
-          signal: AbortSignal.timeout(1000),
-        });
-        assert.ok(suggestions, "the new provider must return suggestions");
-        assert.deepEqual(backends[1].queries, ["MySer"], "the new provider must query the new backend");
-        assert.deepEqual(backends[0].queries, [], "the old backend must never serve queries after shutdown");
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
+        assert.match(fs.readFileSync(path.join(tmpDir, "tags"), "utf8"), /NEW_MANAGER_PUBLISH/);
+        assert.equal(ctagsRuns, 2, "one ctags run per instance");
+        assert.equal(backends.length, 2, "one backend per instance");
+      });
     });
 
     void it("shows the resolver omission reason for the ninth distinct name", async () => {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-9n-"));
-      try {
+      await withTempDir("sym-9n-", async (tmpDir) => {
         const executor: Executor = async (command: string) => {
           if (command === "readtags") {
             return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
@@ -1047,14 +789,13 @@ void describe("symbol autocomplete extension", () => {
 
         const pi = createMockPi(executor);
         const scanned: string[] = [];
-        const createBackend = () => ({
-          queryPrefix: async () => [],
-          queryDotted: async () => [],
-          scanExact: async (name: string, onSymbol: (s: { name: string; kind: string; path: string; line: number }) => void) => {
-            scanned.push(name);
-            onSymbol({ name, kind: "class", path: "src/sym.ts", line: 1 });
-          },
-        });
+        const createBackend = () =>
+          createFakeReadtagsBackend({
+            scanExact: async (name, onSymbol) => {
+              scanned.push(name);
+              onSymbol({ name, kind: "class", path: "src/sym.ts", line: 1 });
+            },
+          });
         symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
 
         const sessionStartHandler = pi.handlers.get("session_start") as
@@ -1067,17 +808,17 @@ void describe("symbol autocomplete extension", () => {
         assert.ok(beforeAgentStartHandler);
 
         const notifyCalls: Array<{ message: string; type: string }> = [];
-        const sessionCtx = createMockCtx({
+        const sessionCtx = createCommandContext({
           cwd: tmpDir,
-          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+          notify: (msg, type) => notifyCalls.push({ message: msg, type }),
         });
 
         sessionStartHandler?.({}, sessionCtx as any);
-        await new Promise((r) => setTimeout(r, 50));
+        await pollUntil(async () => !(await readStatusLine(pi, tmpDir)).includes("In flight: true"));
 
         const prompt = Array.from({ length: 9 }, (_, i) => `#Sym${i}`).join(" ");
         await beforeAgentStartHandler?.(
-          { ...createPromptEventPartial(), prompt },
+          promptEvent(prompt),
           sessionCtx as any,
         );
 
@@ -1087,30 +828,7 @@ void describe("symbol autocomplete extension", () => {
         assert.match(limitWarnings[0].message, /^Symbol autocomplete: /);
         assert.match(limitWarnings[0].message, /Sym8/, "the omitted ninth name must appear");
         assert.equal(limitWarnings[0].type, "warning");
-      } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
+      });
     });
   });
 });
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/** Wait until the tags file exists at `tagsPath`. */
-async function waitForTagsFile(tagsPath: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (fs.existsSync(tagsPath)) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`tags file never appeared at ${tagsPath}`);
-}
-
-function createPromptEventPartial() {
-  return {
-    type: "before_agent_start" as const,
-    prompt: "",
-    images: undefined,
-    systemPrompt: "",
-    systemPromptOptions: {} as any,
-  };
-}
