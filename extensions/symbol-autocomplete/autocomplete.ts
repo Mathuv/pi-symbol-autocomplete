@@ -2,18 +2,20 @@
  * Symbol autocomplete provider for `#` symbol references.
  *
  * Detects valid `#` trigger positions (start/whitespace boundary only),
- * ranks candidates (exact prefix > fuzzy > path-depth tie-break),
+ * queries the readtags backend per keystroke (prefix-only, capped at 50),
  * renders disambiguated suggestions, and inserts stable tokens
  * (`#name@path:line`) on selection.
  *
- * When no `#` trigger is detected, or the symbol index is empty,
- * delegates to the built-in provider.
+ * A query needs at least one character after `#`. Bare `#` and bare
+ * `#Parent.` delegate to the built-in provider. Backend errors and empty
+ * results also delegate; this provider never throws out of getSuggestions.
  */
 
-import type { ProjectSymbol } from "./types.ts";
+import type { ProjectSymbol, ReadtagsBackend } from "./types.ts";
 
 const MAX_LABEL_LENGTH = 96;
 const MAX_DESCRIBED_LABEL_LENGTH = 32;
+const MAX_SUGGESTIONS = 50;
 
 // ── Types matching @earendil-works/pi-tui interfaces ────────────────
 // Defined locally to avoid pi-tui import dependency in tests.
@@ -58,14 +60,16 @@ export interface AutocompleteProvider {
  * Create an autocomplete provider layered over `current`.
  *
  * - Detects `#` at start-of-line or after whitespace (no mid-token).
- * - Ranks by: exact prefix > fuzzy match > path-depth tie-break.
- * - Disambiguates duplicate symbol names by showing `path:line`.
+ * - Routes queries: `#parent.member` → queryDotted, otherwise queryPrefix.
+ * - Caps the result set at 50 items and forwards the abort signal.
+ * - Disambiguates duplicate symbol names within the capped results.
  * - Inserts stable token `#<name>@<path>:<line>` on selection.
- * - Delegates to `current` when no `#` trigger or index is empty.
+ * - Delegates to `current` when there is no trigger, an empty query, a
+ *   backend error, or an empty result set.
  */
 export function createSymbolAutocompleteProvider(
   current: AutocompleteProvider,
-  getSymbols: () => ProjectSymbol[],
+  backend: ReadtagsBackend,
 ): AutocompleteProvider {
   return {
     async getSuggestions(lines, cursorLine, cursorCol, options) {
@@ -78,20 +82,35 @@ export function createSymbolAutocompleteProvider(
       }
 
       const query = match[1] ?? "";
-      const symbols = getSymbols();
-
-      if (symbols.length === 0) {
+      if (!query) {
         return current.getSuggestions(lines, cursorLine, cursorCol, options);
       }
 
-      const ranked = rankSymbols(symbols, query);
+      const dotIndex = query.indexOf(".");
+      let results: ProjectSymbol[] | null;
+      try {
+        results = dotIndex > 0
+          ? (query.slice(dotIndex + 1)
+              ? await backend.queryDotted(query.slice(0, dotIndex), query.slice(dotIndex + 1), MAX_SUGGESTIONS, options.signal)
+              : null)
+          : await backend.queryPrefix(query, MAX_SUGGESTIONS, options.signal);
+      } catch {
+        results = null;
+      }
 
-      if (ranked.length === 0) {
+      if (!results || results.length === 0) {
         return current.getSuggestions(lines, cursorLine, cursorCol, options);
       }
 
-      const isDotted = query.includes(".");
-      const items = ranked.map((sym) => formatSymbolItem(sym, symbols, isDotted));
+      // Never trust the backend beyond the hard cap.
+      const capped = results.slice(0, MAX_SUGGESTIONS);
+
+      const isDotted = dotIndex > 0 && query.slice(dotIndex + 1) !== "";
+      const ranked = isDotted
+        ? rankDotted(capped, query.slice(0, dotIndex))
+        : [...capped].sort(byDepthThenName);
+
+      const items = ranked.map((sym) => formatSymbolItem(sym, capped, isDotted));
 
       return { prefix: `#${query}`, items };
     },
@@ -153,144 +172,19 @@ function byDepthThenName(a: ProjectSymbol, b: ProjectSymbol): number {
 }
 
 /**
- * Simple fuzzy match: all query characters must appear in order in text.
- * Case-insensitive — both inputs should already be lowercased.
+ * Keep the backend's dotted group order: exact parent matches before
+ * parent-prefix matches. Sort within each group by path depth, then name.
+ * Never reorders a prefix-parent group ahead of an exact-parent group.
  */
-function fuzzyMatch(query: string, text: string): boolean {
-  if (!query) return true;
-  if (!text) return false;
-  let qi = 0;
-  for (let ti = 0; ti < text.length && qi < query.length; ti++) {
-    if (text[ti] === query[qi]) qi++;
-  }
-  return qi === query.length;
-}
-
-/**
- * Filter and rank symbols by query.
- *
- * For non-dotted queries:
- *   Ordering: exact prefix (case-insensitive) → fuzzy (all chars in order).
- *   Within each group, tie-break by shallower path first, then alphabetically.
- *
- * For dotted queries (containing a `.`):
- *   Split into parentQuery and memberQuery.
- *   1. Filter symbols where parentName exactly matches parentQuery (case-insensitive).
- *   2. Then add symbols where parentName prefix-matches parentQuery (broader matches).
- *   3. Within each group, match member name by prefix/fuzzy against memberQuery.
- *   4. Falls back to non-dotted matching if no symbols with parentName match.
- */
-function rankSymbols(symbols: ProjectSymbol[], query: string): ProjectSymbol[] {
-  const lowerQuery = query.toLowerCase();
-
-  if (!query) {
-    // Empty query: show all, sorted by path depth then name
-    return [...symbols].sort(byDepthThenName);
-  }
-
-  const dotIndex = lowerQuery.indexOf(".");
-  if (dotIndex >= 0) {
-    const parentQuery = lowerQuery.slice(0, dotIndex);
-    const memberQuery = lowerQuery.slice(dotIndex + 1);
-
-    // Only attempt dotted matching if there's a non-empty parent query
-    if (parentQuery) {
-      // Exact parent matches first, then parent-prefix matches.
-      // This ensures #Campaign.reserva shows Campaign members before
-      // CampaignViewSet/CampaignReservationUseCase members.
-      const exactCandidates = symbols.filter((sym) => {
-        if (!sym.parentName) return false;
-        return sym.parentName.toLowerCase() === parentQuery;
-      });
-
-      const prefixCandidates = symbols.filter((sym) => {
-        if (!sym.parentName) return false;
-        const name = sym.parentName.toLowerCase();
-        return name !== parentQuery && name.startsWith(parentQuery);
-      });
-
-      if (exactCandidates.length > 0 || prefixCandidates.length > 0) {
-        const exactRanked = rankByMember(exactCandidates, memberQuery);
-        const prefixRanked = rankByMember(prefixCandidates, memberQuery);
-        return [...exactRanked, ...prefixRanked];
-      }
-    }
-  }
-
-  // Non-dotted (or fallback) matching
-  const exactPrefix: ProjectSymbol[] = [];
-  const fuzzy: ProjectSymbol[] = [];
-  const seen = new Set<string>();
-
-  const dedupKey = (sym: ProjectSymbol) => `${sym.name}:${sym.path}:${sym.line}`;
-
-  for (const sym of symbols) {
-    const nameLower = sym.name.toLowerCase();
-    if (nameLower.startsWith(lowerQuery)) {
-      const k = dedupKey(sym);
-      if (!seen.has(k)) {
-        seen.add(k);
-        exactPrefix.push(sym);
-      }
-      continue;
-    }
-    // Only non-exact-prefix symbols get fuzzy-matched
-    if (fuzzyMatch(lowerQuery, nameLower)) {
-      const k = dedupKey(sym);
-      if (!seen.has(k)) {
-        seen.add(k);
-        fuzzy.push(sym);
-      }
-    }
-  }
-
-  exactPrefix.sort(byDepthThenName);
-  fuzzy.sort(byDepthThenName);
-
-  return [...exactPrefix, ...fuzzy];
-}
-
-/**
- * Rank candidate symbols (pre-filtered by parentName) against a member query.
- * Uses the same prefix→fuzzy strategy as the main ranker.
- */
-function rankByMember(candidates: ProjectSymbol[], memberQuery: string): ProjectSymbol[] {
-  const lowerQuery = memberQuery.toLowerCase();
-
-  if (!memberQuery) {
-    // Empty member query: show all candidates sorted by path depth then name
-    return [...candidates].sort(byDepthThenName);
-  }
-
-  const exactPrefix: ProjectSymbol[] = [];
-  const fuzzy: ProjectSymbol[] = [];
-  const seen = new Set<string>();
-
-  const dedupKey = (sym: ProjectSymbol) => `${sym.name}:${sym.path}:${sym.line}`;
-
-  for (const sym of candidates) {
-    const nameLower = sym.name.toLowerCase();
-    if (nameLower.startsWith(lowerQuery)) {
-      const k = dedupKey(sym);
-      if (!seen.has(k)) {
-        seen.add(k);
-        exactPrefix.push(sym);
-      }
-      continue;
-    }
-    if (fuzzyMatch(lowerQuery, nameLower)) {
-      const k = dedupKey(sym);
-      if (!seen.has(k)) {
-        seen.add(k);
-        fuzzy.push(sym);
-      }
-    }
-  }
-
-  exactPrefix.sort(byDepthThenName);
-  fuzzy.sort(byDepthThenName);
-
-  return [...exactPrefix, ...fuzzy];
+function rankDotted(symbols: ProjectSymbol[], parentQuery: string): ProjectSymbol[] {
+  const lowerParent = parentQuery.toLowerCase();
+  const exact = symbols.filter((sym) => sym.parentName?.toLowerCase() === lowerParent);
+  const prefix = symbols.filter((sym) =>
+    !!sym.parentName && sym.parentName.toLowerCase() !== lowerParent,
+  );
+  exact.sort(byDepthThenName);
+  prefix.sort(byDepthThenName);
+  return [...exact, ...prefix];
 }
 
 /**
@@ -301,10 +195,11 @@ function rankByMember(candidates: ProjectSymbol[], memberQuery: string): Project
  * Otherwise uses existing `#SymbolName` / `#name@path:line` format.
  *
  * - Description: `Kind · path` (or `Kind · path:line` when name is ambiguous)
+ * - Duplicate counting scans `cappedSymbols` only (at most 50 items).
  */
 function formatSymbolItem(
   sym: ProjectSymbol,
-  allSymbols: ProjectSymbol[],
+  cappedSymbols: ProjectSymbol[],
   isDotted = false,
 ): AutocompleteItem {
   const includeParent = isDotted && !!sym.parentName;
@@ -312,7 +207,7 @@ function formatSymbolItem(
     ? `${sym.parentName}.${sym.name}`
     : sym.name;
 
-  const sameNameCount = allSymbols.filter((s) =>
+  const sameNameCount = cappedSymbols.filter((s) =>
     includeParent && s.parentName
       ? `${s.parentName}.${s.name}` === `${sym.parentName}.${sym.name}`
       : s.name === sym.name,

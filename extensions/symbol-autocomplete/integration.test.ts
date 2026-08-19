@@ -15,8 +15,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { spawnSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import symbolAutocompleteExtension from "./index.ts";
+
+// The autocomplete provider queries the real `readtags` binary against a
+// fixture tags file. Skip when the binary is not installed.
+const HAS_READTAGS = spawnSync("readtags", ["--version"]).status === 0;
+const SKIP_NO_READTAGS = HAS_READTAGS ? false : "readtags binary not available";
 
 // ── Mock PI ────────────────────────────────────────────────────────
 
@@ -124,7 +130,7 @@ function classicTagLine(name: string, filePath: string, kind: string, line: numb
 // ═══════════════════════════════════════════════════════════════════════
 
 void describe("symbol autocomplete integration", () => {
-  void it("loads cwd/tags and serves # autocomplete suggestions without running ctags", { skip: "TODO-3 rewires autocomplete to the readtags backend and re-enables this test" }, async () => {
+  void it("loads cwd/tags and serves # autocomplete suggestions without running ctags", { skip: SKIP_NO_READTAGS }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-tags-"));
     fs.writeFileSync(path.join(tmpDir, "service.ts"), "class MyService {}\n", "utf-8");
     fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
@@ -132,9 +138,13 @@ void describe("symbol autocomplete integration", () => {
     ]), "utf-8");
 
     try {
-      let commandCalls = 0;
-      const executor = async () => {
-        commandCalls++;
+      // The readtags probe must succeed; ctags must never run.
+      const commands: string[] = [];
+      const executor = async (cmd: string) => {
+        commands.push(cmd);
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
         return { code: 127, stdout: "", stderr: "should not run", killed: false };
       };
       const pi = createMockPi(executor);
@@ -150,7 +160,7 @@ void describe("symbol autocomplete integration", () => {
       pi.handlers.get("session_start")({}, ctx);
       await new Promise((r) => setTimeout(r, 50));
 
-      assert.equal(commandCalls, 0, "pre-built tags file should avoid ctags execution");
+      assert.ok(!commands.includes("ctags"), "pre-built tags file should avoid ctags execution");
       assert.ok(providerFactory, "should register autocomplete provider");
 
       const currentProvider = {
@@ -364,7 +374,7 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(result, undefined);
   });
 
-  void it("suggests scoped members via dotted autocomplete from tags file", { skip: "TODO-3 rewires autocomplete to the readtags backend and re-enables this test" }, async () => {
+  void it("suggests scoped members via dotted autocomplete from tags file", { skip: SKIP_NO_READTAGS }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-ac-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",
@@ -380,9 +390,13 @@ void describe("symbol autocomplete integration", () => {
     ]), "utf-8");
 
     try {
-      let commandCalls = 0;
-      const executor = async () => {
-        commandCalls++;
+      // The readtags probe must succeed; ctags must never run.
+      const commands: string[] = [];
+      const executor = async (cmd: string) => {
+        commands.push(cmd);
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
         return { code: 127, stdout: "", stderr: "should not run", killed: false };
       };
       const pi = createMockPi(executor);
@@ -398,7 +412,7 @@ void describe("symbol autocomplete integration", () => {
       pi.handlers.get("session_start")({}, ctx);
       await new Promise((r) => setTimeout(r, 50));
 
-      assert.equal(commandCalls, 0, "pre-built tags file should avoid ctags execution");
+      assert.ok(!commands.includes("ctags"), "pre-built tags file should avoid ctags execution");
       assert.ok(providerFactory, "should register autocomplete provider");
 
       const currentProvider = {

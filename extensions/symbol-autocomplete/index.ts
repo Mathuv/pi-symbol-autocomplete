@@ -12,6 +12,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createTagsManager } from "./tags-manager.ts";
+import { createReadtagsBackend } from "./readtags-backend.ts";
 import { createSymbolAutocompleteProvider } from "./autocomplete.ts";
 import { createRescanHandler, createStatusHandler } from "./commands.ts";
 
@@ -64,9 +65,14 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
     });
 
     // ── Register autocomplete provider ────────────────────────────
-    // Todo 3 rewires the provider to query the readtags backend.
+    // The backend queries the on-disk tags file. A missing or stale
+    // file makes queries fail, so the provider delegates to the default.
+    const backend = createReadtagsBackend({
+      tagsFilePath: indexManager.getStatus().tagsPath,
+      cwd: ctx.cwd,
+    });
     ctx.ui.addAutocompleteProvider((current) =>
-      createSymbolAutocompleteProvider(current, () => []),
+      createSymbolAutocompleteProvider(current, backend),
     );
   });
 
