@@ -191,6 +191,9 @@ if (alias) {
 } else if (mode === "huge-line") {
   process.stdout.write("x".repeat(64 * 1024 + 1));
   setInterval(() => {}, 1000);
+} else if (mode === "alias-symbol") {
+  process.stdout.write("Aliased\\ta.ts\\tpattern\\tkind:c\\tline:1\\tlanguage:TypeScript\\n");
+  process.exit(0);
 } else {
   const total = mode === "scanned" ? 15_000 : 1_000;
   function emit() {
@@ -213,13 +216,17 @@ function readMarker(markerPath: string): string {
   return fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8") : "";
 }
 
-async function waitForKill(markerPath: string): Promise<string> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+async function waitForMarker(markerPath: string, value: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     const marker = readMarker(markerPath);
-    if (marker.includes("K")) return marker;
+    if (marker.includes(value)) return marker;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   return readMarker(markerPath);
+}
+
+async function waitForKill(markerPath: string): Promise<string> {
+  return waitForMarker(markerPath, "K");
 }
 
 void describe("readtags backend bounds", () => {
@@ -252,7 +259,9 @@ void describe("readtags backend bounds", () => {
     const { dir, tagsPath, command, markerPath } = createReadtagsShim("huge-line");
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const started = Date.now();
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
+      assert.ok(Date.now() - started < 2_000);
       assert.match(await waitForKill(markerPath), /K0/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -281,6 +290,25 @@ void describe("readtags backend bounds", () => {
       assert.deepEqual(await backend.queryPrefix("symbol", 50), []);
       assert.ok(Date.now() - started < 5_500);
       assert.equal(await waitForKill(markerPath), "D\nK0");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("retries aliases after an aborted alias load", async () => {
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const controller = new AbortController();
+      const firstQuery = backend.queryPrefix("aliased", 50, controller.signal);
+      assert.match(await waitForMarker(markerPath, "D"), /D/);
+      controller.abort();
+      assert.deepEqual(await firstQuery, []);
+
+      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      const symbols = await backend.queryPrefix("aliased", 50);
+      assert.deepEqual(symbols.map((symbol) => symbol.name), ["Aliased"]);
+      assert.equal(symbols[0].kind, "class");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

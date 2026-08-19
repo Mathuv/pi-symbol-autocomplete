@@ -209,7 +209,7 @@ export function parseTagLine(line: string, aliases: Map<string, string>): Projec
  * Stream `readtags` stdout line by line into `onLine`.
  * The callback returns false to stop; the child is killed on stop.
  * The timeout and the AbortSignal also kill the child.
- * The promise resolves when the stream ends, stops, times out, or aborts.
+ * The promise resolves true only when the stream ends normally.
  */
 function streamReadtags(
   command: string,
@@ -218,10 +218,10 @@ function streamReadtags(
   signal: AbortSignal | undefined,
   deadline: number,
   onLine: (line: string) => boolean,
-): Promise<void> {
+): Promise<boolean> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted || Date.now() >= deadline) {
-      resolve();
+      resolve(false);
       return;
     }
 
@@ -246,7 +246,7 @@ function streamReadtags(
       signal?.removeEventListener("abort", stop);
       lines.close();
       if (error) reject(error);
-      else resolve();
+      else resolve(!stopped);
     };
 
     const stop = () => {
@@ -307,16 +307,16 @@ async function loadKindAliases(
   cwd: string,
   signal: AbortSignal | undefined,
   deadline: number,
-): Promise<Map<string, string>> {
+): Promise<{ aliases: Map<string, string>; complete: boolean }> {
   const aliases = new Map<string, string>();
-  await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
+  const complete = await streamReadtags(command, ["-D", "-t", tagsFilePath], cwd, signal, deadline, (line) => {
     if (line.startsWith(TAG_KIND_DESCRIPTION_PREFIX)) {
       parseKindAlias(line, aliases);
       if (aliases.size >= MAX_KIND_ALIASES) return false;
     }
     return true;
   });
-  return aliases;
+  return { aliases, complete };
 }
 
 /**
@@ -334,7 +334,18 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
   }
 
   function getAliases(signal: AbortSignal | undefined, deadline: number): Promise<Map<string, string>> {
-    aliasesPromise ??= loadKindAliases(readtagsPath, tagsFilePath, cwd, signal, deadline);
+    if (aliasesPromise) return aliasesPromise;
+
+    aliasesPromise = loadKindAliases(readtagsPath, tagsFilePath, cwd, signal, deadline).then(
+      ({ aliases, complete }) => {
+        if (!complete) aliasesPromise = null;
+        return aliases;
+      },
+      (error: unknown) => {
+        aliasesPromise = null;
+        throw error;
+      },
+    );
     return aliasesPromise;
   }
 
