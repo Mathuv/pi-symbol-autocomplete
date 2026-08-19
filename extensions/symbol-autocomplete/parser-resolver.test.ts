@@ -8,12 +8,18 @@
  * - Plain token parsing (#name)
  * - Resolver stable token chain (exact path+line → same-name same-file → unresolved)
  * - Resolver plain token rules (unique → resolved, ambiguous → skip)
+ * - Resolver lookup deduplication (one lookup per distinct name)
  * - Diagnostic metadata on all resolution outcomes
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { ProjectSymbol, ParseResult, ResolveResult } from "./types.ts";
+import type {
+  ProjectSymbol,
+  ParseResult,
+  ReadtagsBackend,
+  ResolveResult,
+} from "./types.ts";
 import { parsePrompt } from "./reference-parser.ts";
 import { resolveReferences } from "./resolver.ts";
 
@@ -30,8 +36,26 @@ const SYMBOLS: ProjectSymbol[] = [
   { name: "Helper", kind: "function", path: "src/utils/helper.ts", line: 1 },
 ];
 
-function refs(symbols: ProjectSymbol[]): ProjectSymbol[] {
-  return symbols;
+// ── Mock backend ────────────────────────────────────────────────────
+
+/**
+ * Create a mock backend whose lookupExact returns the exact-name matches
+ * from `symbols`. Records every lookup name for dedup assertions.
+ */
+function createMockBackend(symbols: ProjectSymbol[]): {
+  backend: ReadtagsBackend;
+  lookupCalls: string[];
+} {
+  const lookupCalls: string[] = [];
+  const backend: ReadtagsBackend = {
+    queryPrefix: async () => [],
+    queryDotted: async () => [],
+    lookupExact: async (name: string) => {
+      lookupCalls.push(name);
+      return symbols.filter((s) => s.name === name);
+    },
+  };
+  return { backend, lookupCalls };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -347,9 +371,10 @@ void describe("parser", () => {
 void describe("resolver", () => {
   // ── Stable token resolution ─────────────────────────────────────
 
-  void it("resolves stable token with exact path+line match", () => {
+  void it("resolves stable token with exact path+line match", async () => {
     const parsed = parsePrompt("#MyService@src/services/my-service.ts:10");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -360,10 +385,11 @@ void describe("resolver", () => {
     assert.equal(r.parsed.type, "stable");
   });
 
-  void it("resolves stable token with stale line (same name+file, different line)", () => {
+  void it("resolves stable token with stale line (same name+file, different line)", async () => {
     // Symbol exists at MyService in same file but at line 10, not 99
     const parsed = parsePrompt("#MyService@src/services/my-service.ts:99");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -374,9 +400,10 @@ void describe("resolver", () => {
     assert.ok(r.message.includes("stale") || r.message.includes("line"));
   });
 
-  void it("reports unresolved for stable token with wrong file", () => {
+  void it("reports unresolved for stable token with wrong file", async () => {
     const parsed = parsePrompt("#MyService@src/nonexistent/file.ts:10");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -385,11 +412,12 @@ void describe("resolver", () => {
     assert.ok(r.message.includes("unresolved") || r.message.includes("not found"));
   });
 
-  void it("does NOT resolve stable token with wrong name on existing path+line", () => {
+  void it("does NOT resolve stable token with wrong name on existing path+line", async () => {
     // Regression: stable token must match name + path + line, not path+line alone.
     // #NonExistent at path:line where MyService exists should NOT resolve.
     const parsed = parsePrompt("#NonExistent@src/services/my-service.ts:10");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -398,10 +426,11 @@ void describe("resolver", () => {
     assert.ok(r.message.includes("unresolved") || r.message.includes("not found"));
   });
 
-  void it("resolves stable token where same name exists but different file — uses stale chain same-file", () => {
+  void it("resolves stable token where same name exists but different file — uses stale chain same-file", async () => {
     // MyService exists in two files. Stable token points to file that has it.
     const parsed = parsePrompt("#MyService@src/deprecated/my-service.ts:3");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -410,11 +439,12 @@ void describe("resolver", () => {
     assert.equal(r.symbol?.line, 3);
   });
 
-  void it("does NOT cross-file fallback for stale stable token", () => {
+  void it("does NOT cross-file fallback for stale stable token", async () => {
     // MyService exists at src/services/my-service.ts:10 and src/deprecated/my-service.ts:3
     // Stable token points to src/nonexistent/my-service.ts:99 — wrong file entirely
     const parsed = parsePrompt("#MyService@src/nonexistent/my-service.ts:99");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -425,9 +455,10 @@ void describe("resolver", () => {
 
   // ── Plain token resolution ──────────────────────────────────────
 
-  void it("resolves plain #name with unique match", () => {
+  void it("resolves plain #name with unique match", async () => {
     const parsed = parsePrompt("#Database");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -436,9 +467,10 @@ void describe("resolver", () => {
     assert.equal(r.symbol?.path, "src/db/database.ts");
   });
 
-  void it("reports ambiguous for plain #name with multiple matches", () => {
+  void it("reports ambiguous for plain #name with multiple matches", async () => {
     const parsed = parsePrompt("#MyService");  // two MyService symbols
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -447,9 +479,10 @@ void describe("resolver", () => {
     assert.ok(r.message.includes("ambiguous") || r.message.includes("multiple"));
   });
 
-  void it("reports unresolved for plain #name with no match", () => {
+  void it("reports unresolved for plain #name with no match", async () => {
     const parsed = parsePrompt("#NonExistent");
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -457,9 +490,10 @@ void describe("resolver", () => {
     assert.equal(r.symbol, null);
   });
 
-  void it("reports ambiguous for #name with multiple matches of same name across files", () => {
+  void it("reports ambiguous for #name with multiple matches of same name across files", async () => {
     const parsed = parsePrompt("#Helper");  // two Helper symbols
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -469,10 +503,11 @@ void describe("resolver", () => {
 
   // ── Injectable results ──────────────────────────────────────────
 
-  void it("includes resolved and stale references in injectable list", () => {
+  void it("includes resolved and stale references in injectable list", async () => {
     const parsed = parsePrompt("#Database\n#MyService\n#NonExistent");
     // #Database → unique, #MyService → ambiguous, #NonExistent → unresolved
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 3);
     assert.equal(result.injectable.length, 1);
@@ -480,7 +515,7 @@ void describe("resolver", () => {
     assert.equal(result.injectable[0].status, "resolved");
   });
 
-  void it("includes stale stable token in injectable list", () => {
+  void it("includes stale stable token in injectable list", async () => {
     // Regression: stable token with same name+file but stale line should
     // be injectable (has a fallback symbol) while surfacing stale warning.
     const parsed = parsePrompt(
@@ -488,7 +523,8 @@ void describe("resolver", () => {
       "\n#Database" +
       "\n#NonExistent"
     );
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 3);
 
@@ -514,25 +550,53 @@ void describe("resolver", () => {
     );
   });
 
+  // ── Lookup deduplication ────────────────────────────────────────
+
+  void it("looks up a repeated name only once per resolve call", async () => {
+    // Plain and stable references to the same name share one lookup.
+    const parsed = parsePrompt(
+      "#MyService\n#MyService@src/services/my-service.ts:10\n#MyService@src/deprecated/my-service.ts:3",
+    );
+    const { backend, lookupCalls } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
+
+    assert.equal(result.resolved.length, 3);
+    assert.equal(
+      lookupCalls.filter((n) => n === "MyService").length,
+      1,
+      "repeated references must share one lookup",
+    );
+  });
+
+  void it("looks up each distinct name exactly once", async () => {
+    const parsed = parsePrompt("#Database\n#Helper");
+    const { backend, lookupCalls } = createMockBackend(SYMBOLS);
+    await resolveReferences(parsed.references, backend);
+
+    assert.deepEqual(lookupCalls.sort(), ["Database", "Helper"]);
+  });
+
   // ── Edge cases ──────────────────────────────────────────────────
 
-  void it("handles empty symbol index", () => {
+  void it("handles empty symbol index", async () => {
     const parsed = parsePrompt("#Database");
-    const result = resolveReferences(parsed.references, []);
+    const { backend } = createMockBackend([]);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.injectable.length, 0);
   });
 
-  void it("handles empty parsed references", () => {
-    const result = resolveReferences([], SYMBOLS);
+  void it("handles empty parsed references", async () => {
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences([], backend);
 
     assert.equal(result.resolved.length, 0);
     assert.equal(result.injectable.length, 0);
   });
 
-  void it("handles multiple references with mixed resolution outcomes", () => {
+  void it("handles multiple references with mixed resolution outcomes", async () => {
     const parsed = parsePrompt([
       "#config",                             // unique → resolved
       "#MyService@src/services/my-service.ts:10", // exact match → resolved
@@ -540,8 +604,8 @@ void describe("resolver", () => {
       "#MyService@src/nonexistent/file.ts:1",    // wrong file → unresolved
       "#Helper",                             // ambiguous → ambiguous
     ].join("\n"));
-
-    const result = resolveReferences(parsed.references, SYMBOLS);
+    const { backend } = createMockBackend(SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 5);
 
@@ -591,9 +655,10 @@ void describe("dotted resolver", () => {
 
   // ── Dotted stable token resolution ────────────────────────────────
 
-  void it("resolves dotted stable token by parent+member+path+line", () => {
+  void it("resolves dotted stable token by parent+member+path+line", async () => {
     const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -604,9 +669,10 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.line, 42);
   });
 
-  void it("resolves dotted stable token as stale when line differs but parent+member+path match", () => {
+  void it("resolves dotted stable token as stale when line differs but parent+member+path match", async () => {
     const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:999");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -618,40 +684,44 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("stale"));
   });
 
-  void it("does NOT cross-file fallback for stale dotted stable token", () => {
+  void it("does NOT cross-file fallback for stale dotted stable token", async () => {
     // Same parent+member but different file should NOT resolve
     const parsed = parsePrompt("#Campaign.reservation_date@src/other/file.ts:42");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[0].symbol, null);
   });
 
-  void it("reports unresolved for dotted stable token with wrong parent", () => {
+  void it("reports unresolved for dotted stable token with wrong parent", async () => {
     const parsed = parsePrompt("#Order.reservation_date@src/models/campaign.ts:42");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[0].symbol, null);
   });
 
-  void it("reports unresolved for dotted stable token with wrong member", () => {
+  void it("reports unresolved for dotted stable token with wrong member", async () => {
     const parsed = parsePrompt("#Campaign.nonExistent@src/models/campaign.ts:42");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[0].symbol, null);
   });
 
-  void it("resolves dotted stable token with non-dotted stable token on same line", () => {
+  void it("resolves dotted stable token with non-dotted stable token on same line", async () => {
     const parsed = parsePrompt([
       "#Campaign.reservation_date@src/models/campaign.ts:42",
       "#Database",
     ].join("\n"));
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 2);
     const dotted = result.resolved.find((r) => r.parsed.name === "Campaign.reservation_date");
@@ -664,9 +734,10 @@ void describe("dotted resolver", () => {
 
   // ── Dotted plain token resolution ────────────────────────────────
 
-  void it("resolves unique dotted plain token by parent+member", () => {
+  void it("resolves unique dotted plain token by parent+member", async () => {
     const parsed = parsePrompt("#Campaign.reservation_date");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -677,10 +748,11 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.line, 42);
   });
 
-  void it("reports ambiguous for dotted plain token with same parent+member across files", () => {
+  void it("reports ambiguous for dotted plain token with same parent+member across files", async () => {
     // Campaign.status exists in two files, so it should be ambiguous
     const parsed = parsePrompt("#Campaign.status");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -689,10 +761,11 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("ambiguous") || r.message.includes("multiple"));
   });
 
-  void it("resolves dotted plain token when same member name exists under different parent", () => {
+  void it("resolves dotted plain token when same member name exists under different parent", async () => {
     // Campaign.reservation_date is unique even though Order.status exists
     const parsed = parsePrompt("#Order.status");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -701,27 +774,30 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.parentName, "Order");
   });
 
-  void it("reports unresolved for dotted plain token with no matching parent+member", () => {
+  void it("reports unresolved for dotted plain token with no matching parent+member", async () => {
     const parsed = parsePrompt("#Campaign.nonExistent");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[0].symbol, null);
   });
 
-  void it("reports unresolved for dotted plain token with no matching parent", () => {
+  void it("reports unresolved for dotted plain token with no matching parent", async () => {
     const parsed = parsePrompt("#NonExistent.status");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "unresolved");
     assert.equal(result.resolved[0].symbol, null);
   });
 
-  void it("resolves non-dotted tokens alongside dotted plain tokens", () => {
+  void it("resolves non-dotted tokens alongside dotted plain tokens", async () => {
     const parsed = parsePrompt("#Database and #Campaign.reservation_date");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 2);
 
@@ -734,9 +810,10 @@ void describe("dotted resolver", () => {
     assert.equal(dottedRef?.symbol?.name, "reservation_date");
   });
 
-  void it("includes dotted resolved plain ref in injectable list", () => {
+  void it("includes dotted resolved plain ref in injectable list", async () => {
     const parsed = parsePrompt("#Database\n#Campaign.reservation_date\n#Campaign.nonExistent");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 3);
 
@@ -754,9 +831,10 @@ void describe("dotted resolver", () => {
     ), "unresolved should not be injectable");
   });
 
-  void it("includes dotted stale stable ref in injectable list", () => {
+  void it("includes dotted stale stable ref in injectable list", async () => {
     const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:999\n#Database");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 2);
 
@@ -773,9 +851,10 @@ void describe("dotted resolver", () => {
     assert.deepEqual(injectableNames, ["Campaign.reservation_date", "Database"]);
   });
 
-  void it("does not include ambiguous dotted plain ref in injectable list", () => {
+  void it("does not include ambiguous dotted plain ref in injectable list", async () => {
     const parsed = parsePrompt("#Campaign.status");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     assert.equal(result.resolved[0].status, "ambiguous");
@@ -784,9 +863,10 @@ void describe("dotted resolver", () => {
 
   // ── Multi-dot regression tests ─────────────────────────────────
 
-  void it("reports unresolved for multi-dot plain token #A.B.C", () => {
+  void it("reports unresolved for multi-dot plain token #A.B.C", async () => {
     const parsed = parsePrompt("#A.B.C");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -796,9 +876,10 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("Unresolved") || r.message.includes("not found") || r.message.includes("no symbol"));
   });
 
-  void it("reports unresolved for multi-dot stable token #A.B.C@path:line", () => {
+  void it("reports unresolved for multi-dot stable token #A.B.C@path:line", async () => {
     const parsed = parsePrompt("#A.B.C@src/foo.ts:1");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -808,9 +889,10 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("multi-dot"));
   });
 
-  void it("reports unresolved for four-segment dotted plain token", () => {
+  void it("reports unresolved for four-segment dotted plain token", async () => {
     const parsed = parsePrompt("#Namespace.Campaign.reservation_date");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -818,10 +900,11 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol, null);
   });
 
-  void it("still resolves valid two-segment dotted plain token", () => {
+  void it("still resolves valid two-segment dotted plain token", async () => {
     // Regression: ensure #Parent.member still works after multi-dot fix
     const parsed = parsePrompt("#Campaign.reservation_date");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -830,10 +913,11 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.parentName, "Campaign");
   });
 
-  void it("still resolves valid two-segment dotted stable token", () => {
+  void it("still resolves valid two-segment dotted stable token", async () => {
     // Regression: ensure #Parent.member@path:line still works after multi-dot fix
     const parsed = parsePrompt("#Campaign.reservation_date@src/models/campaign.ts:42");
-    const result = resolveReferences(parsed.references, DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -844,9 +928,21 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.line, 42);
   });
 
+  void it("does not look up multi-dot names", async () => {
+    // Multi-dot chains are unsupported: they must not reach the backend.
+    const parsed = parsePrompt("#A.B.C\n#Namespace.Campaign.reservation_date");
+    const { backend, lookupCalls } = createMockBackend(DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
+
+    assert.equal(result.resolved.length, 2);
+    assert.equal(result.resolved[0].status, "unresolved");
+    assert.equal(result.resolved[1].status, "unresolved");
+    assert.equal(lookupCalls.length, 0, "multi-dot names must not trigger lookups");
+  });
+
   // ── Multi-dot regression tests: literal dotted symbol ───────────
 
-  void it("reports unresolved for multi-dot plain #A.B.C even when literal A.B.C exists", () => {
+  void it("reports unresolved for multi-dot plain #A.B.C even when literal A.B.C exists", async () => {
     // Regression: a literal symbol named "A.B.C" must NOT be resolved
     // via #A.B.C because multi-dot refs are unsupported chains in v1.
     const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
@@ -854,7 +950,8 @@ void describe("dotted resolver", () => {
       { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
     ];
     const parsed = parsePrompt("#A.B.C");
-    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(LITERAL_DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -863,13 +960,14 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("multi-dot"));
   });
 
-  void it("reports unresolved for multi-dot stable #A.B.C@x.ts:1 even when literal A.B.C exists", () => {
+  void it("reports unresolved for multi-dot stable #A.B.C@x.ts:1 even when literal A.B.C exists", async () => {
     const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
       ...DOTTED_SYMBOLS,
       { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
     ];
     const parsed = parsePrompt("#A.B.C@x.ts:1");
-    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(LITERAL_DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -878,14 +976,15 @@ void describe("dotted resolver", () => {
     assert.ok(r.message.includes("multi-dot"));
   });
 
-  void it("still resolves normal non-dotted refs when literal dotted symbol exists", () => {
+  void it("still resolves normal non-dotted refs when literal dotted symbol exists", async () => {
     // Ensure non-dotted refs are not affected by the presence of dotted-name symbols
     const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
       ...DOTTED_SYMBOLS,
       { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
     ];
     const parsed = parsePrompt("#Database");
-    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(LITERAL_DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];
@@ -893,13 +992,14 @@ void describe("dotted resolver", () => {
     assert.equal(r.symbol?.name, "Database");
   });
 
-  void it("still resolves valid two-segment dotted refs when literal dotted symbol exists", () => {
+  void it("still resolves valid two-segment dotted refs when literal dotted symbol exists", async () => {
     const LITERAL_DOTTED_SYMBOLS: ProjectSymbol[] = [
       ...DOTTED_SYMBOLS,
       { name: "A.B.C", kind: "class", path: "x.ts", line: 1 },
     ];
     const parsed = parsePrompt("#Campaign.reservation_date");
-    const result = resolveReferences(parsed.references, LITERAL_DOTTED_SYMBOLS);
+    const { backend } = createMockBackend(LITERAL_DOTTED_SYMBOLS);
+    const result = await resolveReferences(parsed.references, backend);
 
     assert.equal(result.resolved.length, 1);
     const r = result.resolved[0];

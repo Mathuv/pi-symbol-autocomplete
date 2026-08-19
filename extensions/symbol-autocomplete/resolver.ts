@@ -1,8 +1,8 @@
 /**
  * Symbol reference resolver.
  *
- * Maps parsed references to concrete ProjectSymbols following deterministic
- * resolution rules:
+ * Maps parsed references to concrete ProjectSymbols through exact
+ * readtags lookups, following deterministic resolution rules:
  *
  * - **Stable token** (`#name@path:line`):
  *   1. Exact match on name + path + line → resolved
@@ -18,33 +18,38 @@
  *   - Dotted stable: match by parent + member + path + line (exact)
  *   - Dotted stale stable: same parent + member + file (stale line)
  *   - Dotted plain: match by parent + member (unique → resolved, multiple → ambiguous)
+ *
+ * The backend runs one subprocess per distinct exact name. Repeated
+ * references within one call share the pending lookup.
  */
 
 import type {
   ParsedReference,
   ProjectSymbol,
+  ReadtagsBackend,
   ResolveResult,
   ResolvedReference,
-  ResolveStatus,
 } from "./types.ts";
 
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
- * Resolve parsed references against a symbol index.
+ * Resolve parsed references against the readtags backend.
  *
  * Returns structured outcomes with diagnostic metadata, including an
  * `injectable` subset of references that passed ambiguity/uniqueness checks.
  */
-export function resolveReferences(
+export async function resolveReferences(
   references: ParsedReference[],
-  symbols: ProjectSymbol[],
-): ResolveResult {
+  backend: ReadtagsBackend,
+): Promise<ResolveResult> {
+  // One lookup subprocess per distinct name. Repeated references share
+  // the pending lookup within this call.
+  const lookups = new Map<string, Promise<ProjectSymbol[]>>();
   const resolved: ResolvedReference[] = [];
 
   for (const ref of references) {
-    const outcome = resolveOne(ref, symbols);
-    resolved.push(outcome);
+    resolved.push(await resolveOne(ref, backend, lookups));
   }
 
   return {
@@ -54,6 +59,20 @@ export function resolveReferences(
 }
 
 // ── Internal resolution logic ───────────────────────────────────────
+
+/** Look up an exact name once per resolveReferences call. */
+function lookupExact(
+  name: string,
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
+): Promise<ProjectSymbol[]> {
+  let pending = lookups.get(name);
+  if (!pending) {
+    pending = backend.lookupExact(name);
+    lookups.set(name, pending);
+  }
+  return pending;
+}
 
 /**
  * Split a dotted name into parent and member parts.
@@ -76,23 +95,25 @@ function splitDottedName(name: string): { parentName: string; memberName: string
 }
 
 /**
- * Resolve a single parsed reference against the symbol index.
+ * Resolve a single parsed reference against the backend.
  */
-function resolveOne(
+async function resolveOne(
   ref: ParsedReference,
-  symbols: ProjectSymbol[],
-): ResolvedReference {
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
+): Promise<ResolvedReference> {
   const dotted = splitDottedName(ref.name);
   if (dotted) {
     if (ref.type === "stable") {
-      return resolveDottedStable(ref, symbols, dotted);
+      return resolveDottedStable(ref, backend, lookups, dotted);
     }
-    return resolveDottedPlain(ref, symbols, dotted);
+    return resolveDottedPlain(ref, backend, lookups, dotted);
   }
   // Multi-dot names (e.g. A.B.C) are unsupported chains in v1.
   // splitDottedName returned null because the member contains more dots.
-  // Explicitly return unresolved rather than falling through to non-dotted
-  // resolution which could match a literal symbol with a dotted name.
+  // Explicitly return unresolved without a backend lookup rather than
+  // falling through to non-dotted resolution which could match a literal
+  // symbol with a dotted name.
   if (ref.name.includes(".")) {
     return {
       parsed: ref,
@@ -102,9 +123,9 @@ function resolveOne(
     };
   }
   if (ref.type === "stable") {
-    return resolveStable(ref, symbols);
+    return resolveStable(ref, backend, lookups);
   }
-  return resolvePlain(ref, symbols);
+  return resolvePlain(ref, backend, lookups);
 }
 
 /**
@@ -114,10 +135,11 @@ function resolveOne(
  * 2. Same name + same file (any line) → stale (line number changed)
  * 3. Otherwise → unresolved
  */
-function resolveStable(
+async function resolveStable(
   ref: ParsedReference,
-  symbols: ProjectSymbol[],
-): ResolvedReference {
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
+): Promise<ResolvedReference> {
   const path = ref.path;
   const line = ref.line;
   const name = ref.name;
@@ -132,8 +154,10 @@ function resolveStable(
     };
   }
 
+  const matches = await lookupExact(name, backend, lookups);
+
   // Step 1: Exact name + path + line match
-  const exactMatch = symbols.find(
+  const exactMatch = matches.find(
     (s) => s.name === name && s.path === path && s.line === line,
   );
   if (exactMatch) {
@@ -146,7 +170,7 @@ function resolveStable(
   }
 
   // Step 2: Same name + same file (stale line number)
-  const sameFileMatch = symbols.find(
+  const sameFileMatch = matches.find(
     (s) => s.name === name && s.path === path,
   );
   if (sameFileMatch) {
@@ -174,13 +198,16 @@ function resolveStable(
  * - Multiple → ambiguous (skip)
  * - None → unresolved
  */
-function resolvePlain(
+async function resolvePlain(
   ref: ParsedReference,
-  symbols: ProjectSymbol[],
-): ResolvedReference {
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
+): Promise<ResolvedReference> {
   const name = ref.name;
 
-  const matches = symbols.filter((s) => s.name === name);
+  const matches = (await lookupExact(name, backend, lookups)).filter(
+    (s) => s.name === name,
+  );
 
   if (matches.length === 1) {
     return {
@@ -217,11 +244,12 @@ function resolvePlain(
  * 2. Same parent + member + file (stale line) → stale
  * 3. Otherwise → unresolved (no cross-file fallback)
  */
-function resolveDottedStable(
+async function resolveDottedStable(
   ref: ParsedReference,
-  symbols: ProjectSymbol[],
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
   dotted: { parentName: string; memberName: string },
-): ResolvedReference {
+): Promise<ResolvedReference> {
   const { parentName, memberName } = dotted;
   const path = ref.path;
   const line = ref.line;
@@ -235,8 +263,10 @@ function resolveDottedStable(
     };
   }
 
+  const matches = await lookupExact(memberName, backend, lookups);
+
   // Step 1: Exact parent + member + path + line match
-  const exactMatch = symbols.find(
+  const exactMatch = matches.find(
     (s) => s.parentName === parentName && s.name === memberName && s.path === path && s.line === line,
   );
   if (exactMatch) {
@@ -249,7 +279,7 @@ function resolveDottedStable(
   }
 
   // Step 2: Same parent + member + file (stale line number)
-  const sameFileMatch = symbols.find(
+  const sameFileMatch = matches.find(
     (s) => s.parentName === parentName && s.name === memberName && s.path === path,
   );
   if (sameFileMatch) {
@@ -277,14 +307,15 @@ function resolveDottedStable(
  * - Multiple → ambiguous (skip)
  * - None → unresolved
  */
-function resolveDottedPlain(
+async function resolveDottedPlain(
   ref: ParsedReference,
-  symbols: ProjectSymbol[],
+  backend: ReadtagsBackend,
+  lookups: Map<string, Promise<ProjectSymbol[]>>,
   dotted: { parentName: string; memberName: string },
-): ResolvedReference {
+): Promise<ResolvedReference> {
   const { parentName, memberName } = dotted;
 
-  const matches = symbols.filter(
+  const matches = (await lookupExact(memberName, backend, lookups)).filter(
     (s) => s.parentName === parentName && s.name === memberName,
   );
 

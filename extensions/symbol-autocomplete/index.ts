@@ -4,24 +4,32 @@
  * Wires up:
  * - Commands: `/rescan-symbols` (async tags regeneration) and
  *   `/symbol-autocomplete-status` (status report).
- * - `session_start`: creates the TagsManager, starts async tags ensure,
- *   registers `#` autocomplete provider via `ctx.ui.addAutocompleteProvider`.
- * - Warmup fail-open: if tags are still building at turn time, the turn
- *   proceeds without injection; a single non-spam warning is shown.
+ * - `session_start`: creates the TagsManager and the ReadtagsBackend for
+ *   the session cwd, starts async tags ensure, registers the `#`
+ *   autocomplete provider over the backend.
+ * - `before_agent_start`: parses `#` references from the prompt, resolves
+ *   them against the backend, and injects a hidden custom message with
+ *   the matching symbol definitions.
+ * - Fail-open: a still-building index, a failed engine, or a backend
+ *   error warns once per session and proceeds without injection.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ReadtagsBackend } from "./types.ts";
 import { createTagsManager } from "./tags-manager.ts";
 import { createReadtagsBackend } from "./readtags-backend.ts";
 import { createSymbolAutocompleteProvider } from "./autocomplete.ts";
 import { createRescanHandler, createStatusHandler } from "./commands.ts";
+import { parsePrompt } from "./reference-parser.ts";
+import { resolveReferences } from "./resolver.ts";
+import { buildInjectionPayload } from "./injection.ts";
 
 // ── Per-session warmup warning state ────────────────────────────────
 
 interface WarmupState {
   /** Whether we've already warned about the index still building. */
   warnedBuilding: boolean;
-  /** Whether we've already warned about a fallback/failed engine. */
+  /** Whether we've already warned about a failed/unavailable engine. */
   warnedEngine: boolean;
 }
 
@@ -31,10 +39,16 @@ function freshWarmupState(): WarmupState {
 
 // ── Extension factory ───────────────────────────────────────────────
 
-export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
+export default function symbolAutocompleteExtension(
+  pi: ExtensionAPI,
+  options?: { createBackend?: (tagsFilePath: string, cwd: string) => ReadtagsBackend },
+) {
   // Shared state — persists across session starts within the same
-  // extension runtime (i.e. between `/reload` calls).
+  // extension runtime (i.e. between `/reload` calls). The manager and
+  // the backend are recreated per session_start so handlers always use
+  // the objects of the current session cwd.
   let indexManager: ReturnType<typeof createTagsManager> | null = null;
+  let backend: ReadtagsBackend | null = null;
   let warmup = freshWarmupState();
 
   // ── Register commands (once at load time) ─────────────────────────
@@ -60,27 +74,26 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
     });
 
     // ── Async tags ensure (non-blocking) ────────────────────────
-    indexManager.ensure().catch(() => {
-      // Silently catch — errors are tracked in TagsStatus
-    });
+    // Errors are tracked in TagsStatus.
+    indexManager.ensure().catch(() => {});
+
+    // ── Readtags backend for this session's tags file ───────────
+    const createBackend =
+      options?.createBackend ??
+      ((tagsFilePath: string, cwd: string) => createReadtagsBackend({ tagsFilePath, cwd }));
+    backend = createBackend(indexManager.getStatus().tagsPath, ctx.cwd);
 
     // ── Register autocomplete provider ────────────────────────────
-    // The backend queries the on-disk tags file. A missing or stale
-    // file makes queries fail, so the provider delegates to the default.
-    const backend = createReadtagsBackend({
-      tagsFilePath: indexManager.getStatus().tagsPath,
-      cwd: ctx.cwd,
-    });
     ctx.ui.addAutocompleteProvider((current) =>
-      createSymbolAutocompleteProvider(current, backend),
+      createSymbolAutocompleteProvider(current, backend!),
     );
   });
 
   // ── Turn-time injection ───────────────────────────────────────────
 
-  pi.on("before_agent_start", async (_event, ctx) => {
-    // Guard: no tags manager at all
-    if (!indexManager) return;
+  pi.on("before_agent_start", async (event, ctx) => {
+    // Guard: no manager or backend for the current session
+    if (!indexManager || !backend) return;
 
     const status = indexManager.getStatus();
 
@@ -107,8 +120,69 @@ export default function symbolAutocompleteExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Todo 4 rewires reference resolution and injection to the
-    // readtags backend. Until then the turn proceeds without injection.
-    return;
+    // No usable tags file: skip resolution. The backend would fail.
+    if (status.engine === "none") return;
+
+    // Parse symbol references from the prompt
+    const parseResult = parsePrompt(event.prompt);
+    if (parseResult.references.length === 0) return;
+
+    // Resolve against the backend. A backend failure fails open: warn
+    // once per session and proceed without injection.
+    let resolveResult;
+    try {
+      resolveResult = await resolveReferences(parseResult.references, backend);
+    } catch {
+      if (!warmup.warnedEngine) {
+        ctx.ui.notify(
+          "Symbol autocomplete: symbol lookup failed. Falling back to default autocomplete behavior.",
+          "warning",
+        );
+        warmup.warnedEngine = true;
+      }
+      return;
+    }
+
+    // ── Issue UI warnings for non-injectable refs ──────────────────
+    for (const ref of resolveResult.resolved) {
+      if (ref.status === "unresolved") {
+        ctx.ui.notify(
+          `Symbol autocomplete: "${ref.parsed.name}" not found in index.`,
+          "warning",
+        );
+      } else if (ref.status === "ambiguous") {
+        ctx.ui.notify(
+          `Symbol autocomplete: "${ref.parsed.name}" is ambiguous (multiple matches). Use a stable token or be more specific.`,
+          "warning",
+        );
+      } else if (ref.status === "stale") {
+        ctx.ui.notify(ref.message, "warning");
+      }
+    }
+
+    // ── Build injection payload ─────────────────────────────────────
+    if (resolveResult.injectable.length === 0) return;
+
+    const injection = await buildInjectionPayload(
+      resolveResult.injectable,
+      ctx.cwd,
+    );
+
+    // Nothing to inject (all files failed to read, etc.)
+    if (injection.symbols.length === 0) return;
+
+    // ── Issue cap/missing-file warnings ─────────────────────────────
+    for (const warning of injection.warnings) {
+      ctx.ui.notify(warning, "warning");
+    }
+
+    // ── Inject hidden custom message ────────────────────────────────
+    return {
+      message: {
+        customType: "symbol-context",
+        content: JSON.stringify(injection.symbols),
+        display: false,
+      },
+    };
   });
 }

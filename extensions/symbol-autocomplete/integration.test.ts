@@ -185,7 +185,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects hidden symbol-context message for valid symbol refs (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
+  void it("injects hidden symbol-context message for valid symbol refs (end-to-end)", { skip: SKIP_NO_READTAGS }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-"));
     fs.writeFileSync(path.join(tmpDir, "service.ts"), [
       "/**",
@@ -197,11 +197,21 @@ void describe("symbol autocomplete integration", () => {
       "  getValue(): number { return this.value; }",
       "}",
     ].join("\n"), "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("MyService", "service.ts", "c", 4),
+    ]), "utf-8");
 
     try {
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctags = ctagsLine("MyService", "service.ts", 4, "class");
-      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
+      // The readtags probe must succeed; ctags must never run.
+      const commands: string[] = [];
+      const executor = async (cmd: string) => {
+        commands.push(cmd);
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -209,6 +219,8 @@ void describe("symbol autocomplete integration", () => {
 
       pi.handlers.get("session_start")({}, ctx);
       await new Promise((r) => setTimeout(r, 100));
+
+      assert.ok(!commands.includes("ctags"), "pre-built tags file should avoid ctags execution");
 
       const result = await pi.handlers.get("before_agent_start")(
         createPromptEvent("Use #MyService"),
@@ -237,7 +249,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects stale stable token fallback symbol and surfaces stale warning (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
+  void it("injects stale stable token fallback symbol and surfaces stale warning (end-to-end)", { skip: SKIP_NO_READTAGS }, async () => {
     // Regression: stable token with stale line (same name+file, different line)
     // should resolve to the fallback symbol AND be included in the injection
     // payload (hidden message), while also surfacing a stale warning to the UI.
@@ -252,12 +264,19 @@ void describe("symbol autocomplete integration", () => {
       "  getValue(): number { return this.value; }",
       "}",
     ].join("\n"), "utf-8");
+    // Symbol at line 4, but the stable token references a stale line (99).
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("MyService", "service.ts", "c", 4),
+    ]), "utf-8");
 
     try {
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      // Symbol at line 4, but stable token will reference a stale line (99)
-      const ctags = ctagsLine("MyService", "service.ts", 4, "class");
-      const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
+      const executor = async (cmd: string) => {
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -323,55 +342,82 @@ void describe("symbol autocomplete integration", () => {
     assert.equal(notifyCalls.length, 0);
   });
 
-  void it("issues warning for unresolved symbol refs without injection", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
-    const notifyCalls: Array<{ message: string; type: string }> = [];
-    const ctags = ctagsLine("RealClass", "real.ts", 1, "class");
-    const executor = async () => ({ code: 0, stdout: ctags + "\n", stderr: "", killed: false });
-    const pi = createMockPi(executor);
-    symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+  void it("issues warning for unresolved symbol refs without injection", { skip: SKIP_NO_READTAGS }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-unresolved-"));
+    fs.writeFileSync(path.join(tmpDir, "real.ts"), "class RealClass {}\n", "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("RealClass", "real.ts", "c", 1),
+    ]), "utf-8");
 
-    const ctx = createContext("/test/project", notifyCalls, executor);
+    try {
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      const executor = async (cmd: string) => {
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
-    pi.handlers.get("session_start")({}, ctx);
-    await new Promise((r) => setTimeout(r, 100));
+      const ctx = createContext(tmpDir, notifyCalls, executor);
 
-    const result = await pi.handlers.get("before_agent_start")(
-      createPromptEvent("Use #NonExistent"),
-      ctx,
-    );
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 100));
 
-    const unresolvedWarnings = notifyCalls.filter(
-      (c) => c.message.includes('"NonExistent"') && c.message.includes("not found"),
-    );
-    assert.equal(unresolvedWarnings.length, 1);
-    assert.equal(unresolvedWarnings[0].type, "warning");
-    assert.equal(result, undefined);
+      const result = await pi.handlers.get("before_agent_start")(
+        createPromptEvent("Use #NonExistent"),
+        ctx,
+      );
+
+      const unresolvedWarnings = notifyCalls.filter(
+        (c) => c.message.includes('"NonExistent"') && c.message.includes("not found"),
+      );
+      assert.equal(unresolvedWarnings.length, 1);
+      assert.equal(unresolvedWarnings[0].type, "warning");
+      assert.equal(result, undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
-  void it("issues warning for ambiguous symbol refs without injection", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
-    const notifyCalls: Array<{ message: string; type: string }> = [];
-    const ctags1 = ctagsLine("SharedName", "src/a.ts", 1, "class");
-    const ctags2 = ctagsLine("SharedName", "src/b.ts", 5, "function");
-    const executor = async () => ({ code: 0, stdout: ctags1 + "\n" + ctags2 + "\n", stderr: "", killed: false });
-    const pi = createMockPi(executor);
-    symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
+  void it("issues warning for ambiguous symbol refs without injection", { skip: SKIP_NO_READTAGS }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-ambiguous-"));
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("SharedName", "src/a.ts", "c", 1),
+      classicTagLine("SharedName", "src/b.ts", "f", 5),
+    ]), "utf-8");
 
-    const ctx = createContext("/test/project", notifyCalls, executor);
+    try {
+      const notifyCalls: Array<{ message: string; type: string }> = [];
+      const executor = async (cmd: string) => {
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
+      const pi = createMockPi(executor);
+      symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
-    pi.handlers.get("session_start")({}, ctx);
-    await new Promise((r) => setTimeout(r, 100));
+      const ctx = createContext(tmpDir, notifyCalls, executor);
 
-    const result = await pi.handlers.get("before_agent_start")(
-      createPromptEvent("Use #SharedName"),
-      ctx,
-    );
+      pi.handlers.get("session_start")({}, ctx);
+      await new Promise((r) => setTimeout(r, 100));
 
-    const ambiguousWarnings = notifyCalls.filter(
-      (c) => c.message.includes("ambiguous") && c.message.includes("SharedName"),
-    );
-    assert.equal(ambiguousWarnings.length, 1);
-    assert.equal(ambiguousWarnings[0].type, "warning");
-    assert.equal(result, undefined);
+      const result = await pi.handlers.get("before_agent_start")(
+        createPromptEvent("Use #SharedName"),
+        ctx,
+      );
+
+      const ambiguousWarnings = notifyCalls.filter(
+        (c) => c.message.includes("ambiguous") && c.message.includes("SharedName"),
+      );
+      assert.equal(ambiguousWarnings.length, 1);
+      assert.equal(ambiguousWarnings[0].type, "warning");
+      assert.equal(result, undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   void it("suggests scoped members via dotted autocomplete from tags file", { skip: SKIP_NO_READTAGS }, async () => {
@@ -438,7 +484,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects dotted stable token symbol-context for scoped member (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
+  void it("injects dotted stable token symbol-context for scoped member (end-to-end)", { skip: SKIP_NO_READTAGS }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-stable-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",
@@ -447,15 +493,20 @@ void describe("symbol autocomplete integration", () => {
       "  constructor() { this.reservation_date = ''; }",
       "}",
     ].join("\n"), "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("Campaign", "campaign.ts", "c", 1),
+      classicTagLine("reservation_date", "campaign.ts", "property", 2, "class:Campaign"),
+      classicTagLine("reservation_expiration_date", "campaign.ts", "property", 3, "class:Campaign"),
+    ]), "utf-8");
 
     try {
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctags = [
-        ctagsLine("Campaign", "campaign.ts", 1, "class"),
-        ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
-        ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
-      ].join("\n") + "\n";
-      const executor = async () => ({ code: 0, stdout: ctags, stderr: "", killed: false });
+      const executor = async (cmd: string) => {
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 
@@ -491,7 +542,7 @@ void describe("symbol autocomplete integration", () => {
     }
   });
 
-  void it("injects symbol-context for typed plain dotted reference when unique (end-to-end)", { skip: "TODO-4 rewires resolution to the readtags backend and re-enables this test" }, async () => {
+  void it("injects symbol-context for typed plain dotted reference when unique (end-to-end)", { skip: SKIP_NO_READTAGS }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-dotted-plain-"));
     fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
       "class Campaign {",
@@ -500,15 +551,20 @@ void describe("symbol autocomplete integration", () => {
       "  constructor() { this.reservation_date = ''; }",
       "}",
     ].join("\n"), "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("Campaign", "campaign.ts", "c", 1),
+      classicTagLine("reservation_date", "campaign.ts", "property", 2, "class:Campaign"),
+      classicTagLine("reservation_expiration_date", "campaign.ts", "property", 3, "class:Campaign"),
+    ]), "utf-8");
 
     try {
       const notifyCalls: Array<{ message: string; type: string }> = [];
-      const ctags = [
-        ctagsLine("Campaign", "campaign.ts", 1, "class"),
-        ctagsLine("reservation_date", "campaign.ts", 2, "property", "class:Campaign"),
-        ctagsLine("reservation_expiration_date", "campaign.ts", 3, "property", "class:Campaign"),
-      ].join("\n") + "\n";
-      const executor = async () => ({ code: 0, stdout: ctags, stderr: "", killed: false });
+      const executor = async (cmd: string) => {
+        if (cmd === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        return { code: 127, stdout: "", stderr: "should not run", killed: false };
+      };
       const pi = createMockPi(executor);
       symbolAutocompleteExtension(pi as unknown as ExtensionAPI);
 

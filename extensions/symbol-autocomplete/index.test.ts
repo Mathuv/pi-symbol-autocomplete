@@ -455,6 +455,183 @@ void describe("symbol autocomplete extension", () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     });
+
+    void it("fails open when the backend lookup rejects", async () => {
+      // A backend rejection at the extension boundary must not crash Pi:
+      // warn once per session and proceed without injection.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-bnd-"));
+
+      try {
+        // ctags must write a real tags file so the engine is usable and
+        // resolution actually reaches the (rejecting) backend.
+        const executor: Executor = async (command: string, args: string[]) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            const fIndex = args.indexOf("-f");
+            fs.writeFileSync(
+              args[fIndex + 1],
+              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
+            );
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        };
+
+        const pi = createMockPi(executor);
+        const createBackend = () => ({
+          queryPrefix: async () => [],
+          queryDotted: async () => [],
+          lookupExact: async () => {
+            throw new Error("readtags exploded");
+          },
+        });
+        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+        const sessionStartHandler = pi.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
+          | undefined;
+        assert.ok(sessionStartHandler);
+        assert.ok(beforeAgentStartHandler);
+
+        const notifyCalls: Array<{ message: string; type: string }> = [];
+        const sessionCtx = createMockCtx({
+          cwd: tmpDir,
+          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+        });
+
+        sessionStartHandler?.({}, sessionCtx as any);
+        await new Promise((r) => setTimeout(r, 50));
+
+        const result = await beforeAgentStartHandler?.(
+          { ...createPromptEventPartial(), prompt: "Use #MyService" },
+          sessionCtx as any,
+        );
+
+        assert.equal(result, undefined, "backend failure must skip injection");
+        const failureWarnings = notifyCalls.filter(
+          (c) => c.message.includes("lookup failed"),
+        );
+        assert.equal(failureWarnings.length, 1, "warn exactly once");
+        assert.equal(failureWarnings[0].type, "warning");
+
+        // Second turn: no additional warning (non-spam).
+        await beforeAgentStartHandler?.(
+          { ...createPromptEventPartial(), prompt: "Use #MyService" },
+          sessionCtx as any,
+        );
+        assert.equal(
+          notifyCalls.filter((c) => c.message.includes("lookup failed")).length,
+          1,
+          "no additional backend-failure warning",
+        );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    void it("recreates manager and backend per session cwd without stale closures", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "sym-sess-b-"));
+
+      try {
+        // ctags writes the tags file; the probe must succeed.
+        const ctagsTargets: string[] = [];
+        const executor: Executor = async (command: string, args: string[]) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            const target = args[args.indexOf("-f") + 1];
+            ctagsTargets.push(target);
+            fs.writeFileSync(
+              target,
+              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
+            );
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        };
+
+        const pi = createMockPi(executor);
+
+        // Track every backend instance and which one served the turn.
+        const backends: Array<{ tagsFilePath: string; cwd: string; lookups: string[] }> = [];
+        const createBackend = (tagsFilePath: string, cwd: string) => {
+          const record = { tagsFilePath, cwd, lookups: [] as string[] };
+          backends.push(record);
+          return {
+            queryPrefix: async () => [],
+            queryDotted: async () => [],
+            lookupExact: async (name: string) => {
+              record.lookups.push(name);
+              return [{ name, kind: "class", path: "service.ts", line: 1 }];
+            },
+          };
+        };
+        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+        const sessionStartHandler = pi.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
+          | undefined;
+        assert.ok(sessionStartHandler);
+        assert.ok(beforeAgentStartHandler);
+
+        // Start session A, then a second session in a different cwd.
+        sessionStartHandler?.({}, createMockCtx({ cwd: dirA }));
+        await new Promise((r) => setTimeout(r, 50));
+        sessionStartHandler?.({}, createMockCtx({ cwd: dirB }));
+        await new Promise((r) => setTimeout(r, 50));
+
+        assert.equal(backends.length, 2, "one backend per session");
+        assert.equal(backends[0].cwd, dirA);
+        assert.equal(backends[1].cwd, dirB);
+        assert.equal(backends[1].tagsFilePath, path.join(dirB, "tags"));
+
+        // Write the file the mock symbol path points at, so injection succeeds.
+        fs.writeFileSync(path.join(dirB, "service.ts"), "class MyService {}\n");
+
+        const notifyCalls: Array<{ message: string; type: string }> = [];
+        const ctxB = createMockCtx({
+          cwd: dirB,
+          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+        });
+
+        const result = await beforeAgentStartHandler?.(
+          { ...createPromptEventPartial(), prompt: "Use #MyService" },
+          ctxB as any,
+        );
+
+        // The turn must resolve through the backend of the current session.
+        assert.ok(result !== undefined, "should inject via the current backend");
+        assert.deepEqual(backends[0].lookups, [], "no lookup on the stale session A backend");
+        assert.deepEqual(backends[1].lookups, ["MyService"]);
+
+        // Command handlers must use the current session's manager.
+        const rescanHandler = pi.commands.get("rescan-symbols") as
+          | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
+          | undefined;
+        assert.ok(rescanHandler);
+        await rescanHandler("", ctxB as any);
+        await new Promise((r) => setTimeout(r, 50));
+
+        assert.equal(
+          ctagsTargets[ctagsTargets.length - 1],
+          path.join(dirB, "tags"),
+          "rescan must regenerate the current session's tags file",
+        );
+      } finally {
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
   });
 });
 
