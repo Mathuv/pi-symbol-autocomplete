@@ -67,6 +67,15 @@ export function createTagsManager(options: {
     isBuilding: false,
   };
 
+  // Manager lifetime. shutdown() aborts it; every executor call passes
+  // its signal so pi.exec kills the child. The probe and ctags share it.
+  const lifetimeController = new AbortController();
+  // True after shutdown(). An obsolete manager never publishes tags and
+  // accepts no new work.
+  let obsolete = false;
+  // The settled shutdown promise. shutdown() is idempotent.
+  let shutdownPromise: Promise<void> | null = null;
+
   let probeResult: Promise<boolean> | null = null;
   // Permanent queue tail. Each distinct request runs only after the
   // previous request settles, so ctags processes never overlap.
@@ -85,7 +94,11 @@ export function createTagsManager(options: {
 
   /** Probe readtags once per manager instance. */
   function probeReadtags(): Promise<boolean> {
-    probeResult ??= executor("readtags", ["--version"], { cwd, timeout: PROBE_TIMEOUT_MS }).then(
+    probeResult ??= executor("readtags", ["--version"], {
+      cwd,
+      timeout: PROBE_TIMEOUT_MS,
+      signal: lifetimeController.signal,
+    }).then(
       (result) => {
         // pi.exec resolves a killed run with code 0. A killed probe must
         // disable the feature like a missing readtags.
@@ -133,6 +146,8 @@ export function createTagsManager(options: {
 
   /** Run one ctags command and record the outcome. */
   async function runCtags(): Promise<void> {
+    // An obsolete manager never starts new work.
+    if (obsolete) return;
     // ctags writes to a unique temporary file in the tags directory. The
     // live file is replaced atomically only after a complete build, so a
     // failed build never leaves a partial live tags file.
@@ -153,7 +168,11 @@ export function createTagsManager(options: {
     try {
       let result: ExecResult;
       try {
-        result = await executor("ctags", args, { cwd, timeout: ctagsTimeout });
+        result = await executor("ctags", args, {
+          cwd,
+          timeout: ctagsTimeout,
+          signal: lifetimeController.signal,
+        });
       } catch {
         await recordOutcome(CTAGS_NOT_FOUND);
         return;
@@ -170,6 +189,11 @@ export function createTagsManager(options: {
         await recordOutcome(`${detail} — ${CTAGS_HINT}`);
         return;
       }
+
+      // The executor may ignore the abort signal and return code 0 after
+      // shutdown. An obsolete manager checks immediately before rename so
+      // it never publishes a late build.
+      if (obsolete) return;
 
       try {
         // Atomically replace the live file only with a complete build.
@@ -191,6 +215,7 @@ export function createTagsManager(options: {
    * Joins a ctags attempt that started after this request was scheduled.
    */
   async function runEnsure(observedAttempt: number): Promise<void> {
+    if (obsolete) return;
     if (ctagsAttemptId !== observedAttempt) return;
     status = { ...status, lastError: null };
     try {
@@ -220,6 +245,7 @@ export function createTagsManager(options: {
    * Joins a ctags attempt that started after this request was scheduled.
    */
   async function runRegenerate(observedAttempt: number): Promise<void> {
+    if (obsolete) return;
     if (ctagsAttemptId !== observedAttempt) return;
     status = { ...status, lastError: null };
     try {
@@ -239,6 +265,8 @@ export function createTagsManager(options: {
    * failures. Each finalizer clears its own request pointer only.
    */
   function coordinate(kind: "ensure" | "regenerate"): Promise<void> {
+    // After shutdown, calls become safe no-ops.
+    if (obsolete) return Promise.resolve();
     if (kind === "ensure" && ensureRequest !== null) return ensureRequest;
     if (kind === "regenerate" && regenerateRequest !== null) return regenerateRequest;
 
@@ -274,5 +302,19 @@ export function createTagsManager(options: {
     return status;
   }
 
-  return { ensure, regenerate, getStatus };
+  /**
+   * Stop the manager. Idempotent. Marks the manager obsolete, aborts the
+   * lifetime signal, and resolves after queued and active work settles.
+   */
+  function shutdown(): Promise<void> {
+    if (shutdownPromise !== null) return shutdownPromise;
+    // Mark obsolete before reading the tail: any coordinate call after
+    // this point returns immediately and never appends to the tail.
+    obsolete = true;
+    lifetimeController.abort();
+    shutdownPromise = tail;
+    return shutdownPromise;
+  }
+
+  return { ensure, regenerate, getStatus, shutdown };
 }

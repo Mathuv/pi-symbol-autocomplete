@@ -46,6 +46,7 @@ function createMockManager(overrides?: {
     ensure: async () => {},
     regenerate: async () => {},
     getStatus: () => status,
+    shutdown: async () => {},
   };
 }
 
@@ -873,6 +874,219 @@ void describe("symbol autocomplete extension", () => {
           statusNotify[0].message.includes(path.resolve(tmpDir, "tags")),
           "status must report the reused manager's tags path",
         );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    void it("old manager never publishes after session_shutdown; a new instance publishes and serves new state", async () => {
+      // Real Pi lifecycle: pi emits and awaits session_shutdown, tears down
+      // the old runtime, then starts the new extension instance. The old
+      // manager must never publish its build, even when the executor
+      // ignores the abort signal and returns code 0 during shutdown.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-xfact-"));
+
+      try {
+        // First ctags run is gated until shutdown; it ignores the signal
+        // and returns code 0. The second run (new instance) succeeds.
+        let ctagsRuns = 0;
+        let releaseFirstCtags: () => void = () => {};
+        const firstCtagsGate = new Promise<void>((resolve) => { releaseFirstCtags = resolve; });
+        let firstCtagsStarted: () => void = () => {};
+        const firstCtagsStartedPromise = new Promise<void>((resolve) => { firstCtagsStarted = resolve; });
+
+        const executor: Executor = async (command: string, args: string[]) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            ctagsRuns += 1;
+            const target = args[args.indexOf("-f") + 1];
+            if (ctagsRuns === 1) {
+              firstCtagsStarted();
+              await firstCtagsGate;
+              fs.writeFileSync(target, "OLD_MANAGER_PUBLISH\n");
+              return { code: 0, stdout: "", stderr: "", killed: false };
+            }
+            fs.writeFileSync(target, "NEW_MANAGER_PUBLISH\n");
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 1, stdout: "", stderr: "", killed: false };
+        };
+
+        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[] }> = [];
+        const providerFactories: Array<(current: unknown) => unknown> = [];
+        const createBackend = (tagsFilePath: string, cwd: string) => {
+          const record = { tagsFilePath, cwd, queries: [] as string[] };
+          backends.push(record);
+          return {
+            queryPrefix: async (query: string) => {
+              record.queries.push(query);
+              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
+            },
+            queryDotted: async () => [],
+            scanExact: async () => {},
+          };
+        };
+        const makeSessionCtx = () =>
+          createMockCtx({
+            cwd: tmpDir,
+            ui: {
+              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
+                providerFactories.push(factory);
+              },
+            },
+          });
+
+        // ── Old extension instance: gated tags build ────────────────
+        const pi1 = createMockPi(executor);
+        symbolAutocompleteExtension(pi1 as unknown as ExtensionAPI, { createBackend });
+        const sessionStart1 = pi1.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        const sessionShutdown = pi1.handlers.get("session_shutdown") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<void>)
+          | undefined;
+        assert.ok(sessionStart1);
+        assert.ok(sessionShutdown);
+
+        sessionStart1?.({}, makeSessionCtx());
+        await firstCtagsStartedPromise;
+        assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false);
+
+        // ── Pi teardown: dispatch and await session_shutdown ────────
+        const shutdownPromise = sessionShutdown({}, makeSessionCtx());
+        releaseFirstCtags(); // the executor ignores the signal; returns code 0
+        await shutdownPromise;
+
+        // The obsolete manager must never publish, and no temp remains.
+        assert.equal(
+          fs.existsSync(path.join(tmpDir, "tags")),
+          false,
+          "old manager must not publish after shutdown",
+        );
+        assert.deepEqual(
+          fs.readdirSync(tmpDir).filter((f) => f.startsWith(".tags.tmp-")),
+          [],
+          "shutdown must clean the old manager's temp file",
+        );
+
+        // ── New extension instance (real Pi replacement) ────────────
+        const pi2 = createMockPi(executor);
+        symbolAutocompleteExtension(pi2 as unknown as ExtensionAPI, { createBackend });
+        const sessionStart2 = pi2.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        assert.ok(sessionStart2);
+        sessionStart2?.({}, makeSessionCtx());
+        await waitForTagsFile(path.join(tmpDir, "tags"));
+
+        const published = fs.readFileSync(path.join(tmpDir, "tags"), "utf8");
+        assert.match(published, /NEW_MANAGER_PUBLISH/);
+        assert.ok(!published.includes("OLD_MANAGER_PUBLISH"), "the old build must never reach the live file");
+        assert.equal(ctagsRuns, 2, "one ctags run per factory instance");
+        assert.equal(backends.length, 2, "one backend per factory instance");
+
+        // ── Commands use the new manager's state ────────────────────
+        const statusHandler = pi2.commands.get("symbol-autocomplete-status") as
+          | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
+          | undefined;
+        assert.ok(statusHandler);
+        const statusNotify: Array<{ message: string; type: string }> = [];
+        await statusHandler("", createMockCtx({
+          cwd: tmpDir,
+          ui: { notify: (msg, type) => statusNotify.push({ message: msg, type }) },
+        }) as any);
+        assert.equal(statusNotify.length, 1);
+        assert.match(statusNotify[0].message, /Engine: generated/);
+        assert.ok(statusNotify[0].message.includes(path.resolve(tmpDir, "tags")));
+
+        // ── The new provider queries the new backend ────────────────
+        const provider = providerFactories[1]({
+          async getSuggestions() {
+            return null;
+          },
+          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
+            const line = lines[cursorLine] ?? "";
+            const start = cursorCol - prefix.length;
+            const nextLines = [...lines];
+            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
+            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+          },
+          shouldTriggerFileCompletion() {
+            return true;
+          },
+        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
+        const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
+          signal: AbortSignal.timeout(1000),
+        });
+        assert.ok(suggestions, "the new provider must return suggestions");
+        assert.deepEqual(backends[1].queries, ["MySer"], "the new provider must query the new backend");
+        assert.deepEqual(backends[0].queries, [], "the old backend must never serve queries after shutdown");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    void it("shows the resolver omission reason for the ninth distinct name", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-9n-"));
+      try {
+        const executor: Executor = async (command: string) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            fs.writeFileSync(
+              path.join(tmpDir, "tags"),
+              "Seed\tsrc/seed.ts\t/^class Seed$/;\"\tc\tline:1\n",
+            );
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        };
+
+        const pi = createMockPi(executor);
+        const scanned: string[] = [];
+        const createBackend = () => ({
+          queryPrefix: async () => [],
+          queryDotted: async () => [],
+          scanExact: async (name: string, onSymbol: (s: { name: string; kind: string; path: string; line: number }) => void) => {
+            scanned.push(name);
+            onSymbol({ name, kind: "class", path: "src/sym.ts", line: 1 });
+          },
+        });
+        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+        const sessionStartHandler = pi.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        const beforeAgentStartHandler = pi.handlers.get("before_agent_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>)
+          | undefined;
+        assert.ok(sessionStartHandler);
+        assert.ok(beforeAgentStartHandler);
+
+        const notifyCalls: Array<{ message: string; type: string }> = [];
+        const sessionCtx = createMockCtx({
+          cwd: tmpDir,
+          ui: { notify: (msg, type) => notifyCalls.push({ message: msg, type }) },
+        });
+
+        sessionStartHandler?.({}, sessionCtx as any);
+        await new Promise((r) => setTimeout(r, 50));
+
+        const prompt = Array.from({ length: 9 }, (_, i) => `#Sym${i}`).join(" ");
+        await beforeAgentStartHandler?.(
+          { ...createPromptEventPartial(), prompt },
+          sessionCtx as any,
+        );
+
+        assert.equal(scanned.length, 8, "only the first 8 distinct names are scanned");
+        const limitWarnings = notifyCalls.filter((c) => c.message.includes("8-name lookup limit"));
+        assert.equal(limitWarnings.length, 1);
+        assert.match(limitWarnings[0].message, /^Symbol autocomplete: /);
+        assert.match(limitWarnings[0].message, /Sym8/, "the omitted ninth name must appear");
+        assert.equal(limitWarnings[0].type, "warning");
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }

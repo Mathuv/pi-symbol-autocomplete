@@ -183,7 +183,17 @@ function stopped() { fs.writeFileSync(marker, fs.readFileSync(marker, "utf8") + 
 process.on("SIGTERM", stopped);
 if (alias) {
   if (mode === "slow-alias") setInterval(() => {}, 1000);
-  else if (mode === "alias-cap") {
+  else if (mode === "gated-alias") {
+    fs.appendFileSync(marker, "P" + process.pid + "\\n");
+    const gate = marker + "-go";
+    (function poll() {
+      if (fs.existsSync(gate)) {
+        process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc,class\\n");
+        process.exit(0);
+      }
+      setTimeout(poll, 5);
+    })();
+  } else if (mode === "alias-cap") {
     for (let index = 0; index <= 1_000; index += 1) {
       process.stdout.write("!_TAG_KIND_DESCRIPTION!TypeScript\\tc" + index + ",class\\n");
     }
@@ -391,32 +401,47 @@ void describe("readtags backend bounds", () => {
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       await assert.rejects(backend.queryPrefix("symbol", 1), /did not complete/);
-      assert.match(await waitForKill(markerPath), /K\d+/);
+      // The active caller retries an incomplete shared load exactly once:
+      // the marker records two -D spawns and two kills.
+      const marker = readMarker(markerPath);
+      assert.match(marker, /K\d+/);
+      assert.equal(
+        marker.match(/D/g)?.length,
+        2,
+        "an incomplete shared load must retry once for an active caller",
+      );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   void it("keeps an active caller's alias load complete when the first caller aborts", async () => {
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
+    // P2: the shared alias load must not belong to one caller. A and B
+    // abort in sequence while C stays active; C must receive the complete
+    // aliases and a successful query, and the shared child must survive.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const aController = new AbortController();
       const bController = new AbortController();
 
-      // A starts the shared alias load; B joins it while the load is in flight.
+      // A starts the shared alias load; B and C join it while it is gated.
       const aQuery = backend.queryPrefix("aliased", 50, aController.signal);
-      assert.match(await waitForMarker(markerPath, "D"), /D/);
+      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
       const bQuery = backend.queryPrefix("aliased", 50, bController.signal);
+      const cQuery = backend.queryPrefix("aliased", 50);
 
-      // Point B's retry at a tags file that serves a complete alias load,
-      // then abort A. The shared load dies with A, but B must not inherit
-      // the abort or consume the partial alias map.
-      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      // A aborts, then B aborts. C remains, so the shared load must not die.
       aController.abort();
       assert.deepEqual(await aQuery, []);
+      bController.abort();
+      assert.deepEqual(await bQuery, []);
+      assert.ok(!readMarker(markerPath).includes("K"), "the shared child must survive while C waits");
 
-      const symbols = await bQuery;
+      // Point C's query at a complete alias load, then release the gate.
+      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      fs.writeFileSync(markerPath + "-go", "");
+      const symbols = await cQuery;
       assert.deepEqual(symbols.map((symbol) => symbol.name), ["Aliased"]);
       assert.equal(symbols[0].kind, "class");
     } finally {
@@ -424,31 +449,61 @@ void describe("readtags backend bounds", () => {
     }
   });
 
-  void it("keeps an active exact caller's alias load complete when the first caller aborts", async () => {
-    // P2: scanExact must use the shared retry path. An aborted caller A
-    // must not make active exact caller B reject or scan with partial
-    // aliases.
-    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
+  void it("keeps an active exact caller's alias load complete when the first callers abort", async () => {
+    // P2: scanExact must use the same ref-counted shared load. A and B
+    // abort while C scans; C must not inherit the abort or scan with
+    // partial aliases.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
     try {
       const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
       const aController = new AbortController();
       const bController = new AbortController();
 
-      // A starts the shared alias load; B joins it while the load is in flight.
       const seen: ProjectSymbol[] = [];
       const aScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), aController.signal);
-      assert.match(await waitForMarker(markerPath, "D"), /D/);
+      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
       const bScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), bController.signal);
+      const cScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol));
 
-      // Point B's retry at a tags file that serves a complete alias load,
-      // then abort A. B must not inherit the abort or the partial map.
-      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
       aController.abort();
-
       await assert.rejects(aScan, /interrupted/);
-      await bScan;
+      bController.abort();
+      await assert.rejects(bScan, /interrupted/);
+
+      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      fs.writeFileSync(markerPath + "-go", "");
+      await cScan;
       assert.deepEqual(seen.map((symbol) => symbol.name), ["Aliased"]);
       assert.equal(seen[0].kind, "class");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("stops the shared alias child when every caller aborts", async () => {
+    // P2: when the final waiter leaves before the load completes, the
+    // shared subprocess is aborted so no orphan process survives.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("gated-alias");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const aController = new AbortController();
+      const bController = new AbortController();
+
+      const aQuery = backend.queryPrefix("aliased", 50, aController.signal);
+      assert.match(await waitForMarker(markerPath, "P"), /P\d+/);
+      const bQuery = backend.queryPrefix("aliased", 50, bController.signal);
+
+      aController.abort();
+      assert.deepEqual(await aQuery, []);
+      bController.abort();
+      assert.deepEqual(await bQuery, []);
+
+      const marker = await waitForKill(markerPath);
+      const pid = Number.parseInt(marker.match(/P(\d+)/)![1], 10);
+      assert.throws(
+        () => process.kill(pid, 0),
+        "the shared child must be dead after the last caller aborts",
+      );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

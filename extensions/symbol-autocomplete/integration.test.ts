@@ -421,10 +421,11 @@ void describe("symbol autocomplete integration", () => {
       );
 
       const unresolvedWarnings = notifyCalls.filter(
-        (c) => c.message.includes('"NonExistent"') && c.message.includes("not found"),
+        (c) => c.message.includes('no symbol named "NonExistent"'),
       );
       assert.equal(unresolvedWarnings.length, 1);
       assert.equal(unresolvedWarnings[0].type, "warning");
+      assert.match(unresolvedWarnings[0].message, /^Symbol autocomplete: /);
       assert.equal(result, undefined);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

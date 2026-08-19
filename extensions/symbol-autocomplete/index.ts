@@ -103,6 +103,19 @@ export default function symbolAutocompleteExtension(
     );
   });
 
+  // ── Session teardown ──────────────────────────────────────────────
+
+  // Pi awaits this handler before it tears down the runtime and starts
+  // the replacement extension instance. Clear the lifecycle references
+  // and await the old manager so it can never publish late tags.
+  pi.on("session_shutdown", async () => {
+    const oldManager = indexManager;
+    indexManager = null;
+    backend = null;
+    warmup = freshWarmupState();
+    if (oldManager) await oldManager.shutdown();
+  });
+
   // ── Turn-time injection ───────────────────────────────────────────
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -160,10 +173,9 @@ export default function symbolAutocompleteExtension(
     // ── Issue UI warnings for non-injectable refs ──────────────────
     for (const ref of resolveResult.resolved) {
       if (ref.status === "unresolved") {
-        ctx.ui.notify(
-          `Symbol autocomplete: "${ref.parsed.name}" not found in index.`,
-          "warning",
-        );
+        // The resolver message states the real omission reason (e.g. the
+        // 8-name lookup limit); do not replace it with a generic message.
+        ctx.ui.notify(`Symbol autocomplete: ${ref.message}`, "warning");
       } else if (ref.status === "ambiguous") {
         ctx.ui.notify(
           `Symbol autocomplete: "${ref.parsed.name}" is ambiguous (multiple matches). Use a stable token or be more specific.`,

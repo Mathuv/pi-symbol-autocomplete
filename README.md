@@ -43,7 +43,7 @@ Selecting a suggestion inserts a stable token:
 Example:
 
 ```text
-Explain #createReadtagsBackend@extensions/symbol-autocomplete/readtags-backend.ts:353
+Explain #MyService@src/services/my-service.ts:12
 ```
 
 On submit, Pi injects a hidden `symbol-context` message containing the resolved symbol metadata, definition snippet, and bounded surrounding context. The user-authored prompt text is not rewritten.
@@ -79,7 +79,7 @@ Add `tags` to your `.gitignore` so the generated file is not committed. The exte
 
 ## Memory
 
-The tags file stays on disk. Each query runs a `readtags` subprocess whose output is streamed line by line; the output is never buffered whole. Every query enforces hard bounds: a result cap, a scanned-line cap, a byte cap per line, a time cap, and an abort signal. The resolver keeps at most two candidate symbols per reference. Memory use stays bounded. The extension does not promise a specific byte count.
+The tags file stays on disk. Each query runs a `readtags` subprocess whose output is streamed line by line; the output is never buffered whole. Autocomplete queries stop at the 50-result cap. Exact resolver scans intentionally stream every exact match and use scanned-line, per-line byte, total-time, and abort bounds instead of a result cap. Alias loading has its own line and record bounds. The resolver keeps at most two candidate symbols per reference. Memory use stays bounded. The extension does not promise a specific byte count.
 
 ## Limits
 

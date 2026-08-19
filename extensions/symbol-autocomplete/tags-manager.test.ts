@@ -749,3 +749,124 @@ void describe("tags manager status", () => {
     assert.equal(status.lastError, null);
   });
 });
+
+// ── shutdown() ──────────────────────────────────────────────────────
+
+void describe("tags manager shutdown()", () => {
+  void it("aborts in-flight work and settles queued work before resolving", { timeout: 5_000 }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-shut-"));
+    const gates = [deferred(), deferred()];
+    const attemptStarted = [deferred(), deferred()];
+    const signalByAttempt: Array<AbortSignal | undefined> = [];
+    try {
+      const executor: Executor = async (command, args, execOptions) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          const attempt = signalByAttempt.length + 1;
+          signalByAttempt.push(execOptions?.signal);
+          attemptStarted[attempt - 1].resolve();
+          await gates[attempt - 1].promise;
+          // This executor ignores the abort signal and returns code 0.
+          writeTagsAt(args);
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const regeneratePromise = manager.regenerate(); // attempt 1, gated
+      await attemptStarted[0].promise;
+      const ensurePromise = manager.ensure(); // queued behind attempt 1
+
+      const shutdownPromise = manager.shutdown();
+      // The lifetime signal must reach the executor and be aborted.
+      assert.equal(signalByAttempt[0]?.aborted, true);
+      // A second shutdown call is a safe no-op that returns the same work.
+      assert.equal(manager.shutdown(), shutdownPromise);
+
+      // Release the gate during shutdown. The executor ignores the abort
+      // and returns code 0, but the obsolete manager must skip the rename.
+      gates[0].resolve();
+      await shutdownPromise;
+      await Promise.all([regeneratePromise, ensurePromise]);
+
+      assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false, "an obsolete manager must never publish");
+      assert.deepEqual(
+        fs.readdirSync(tmpDir).filter((f) => f.startsWith(".tags.tmp-")),
+        [],
+        "shutdown must leave no temp file behind",
+      );
+      assert.equal(manager.getStatus().engine, "none");
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      gates[0].resolve();
+      gates[1].resolve();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("makes ensure() and regenerate() safe no-ops after shutdown", { timeout: 5_000 }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-shut2-"));
+    try {
+      let ctagsRuns = 0;
+      const { executor } = createMockExecutor({
+        onCtags: (args) => {
+          ctagsRuns += 1;
+          writeTagsAt(args);
+        },
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.shutdown();
+      await manager.ensure();
+      await manager.regenerate();
+
+      assert.equal(ctagsRuns, 0, "no ctags may run after shutdown");
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("kills an in-flight ctags via the lifetime signal", { timeout: 5_000 }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-shut3-"));
+    const started = deferred();
+    try {
+      const executor: Executor = async (command, args, execOptions) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          started.resolve();
+          writeTagsAt(args);
+          // A signal-abiding executor waits for the abort, then reports
+          // the run as killed, like pi.exec does.
+          await new Promise<void>((resolve) => {
+            const signal = execOptions?.signal;
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { code: 0, stdout: "", stderr: "", killed: true };
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const ensurePromise = manager.ensure();
+      await started.promise;
+      await manager.shutdown();
+      await ensurePromise;
+
+      assert.equal(fs.existsSync(path.join(tmpDir, "tags")), false);
+      assert.match(manager.getStatus().lastError ?? "", /ctags timed out/);
+      assert.deepEqual(
+        fs.readdirSync(tmpDir).filter((f) => f.startsWith(".tags.tmp-")),
+        [],
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});

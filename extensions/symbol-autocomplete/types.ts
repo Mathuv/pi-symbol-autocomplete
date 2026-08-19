@@ -47,7 +47,7 @@ export interface ExecResult {
 export type Executor = (
   command: string,
   args: string[],
-  options?: { cwd?: string; timeout?: number },
+  options?: { cwd?: string; timeout?: number; signal?: AbortSignal },
 ) => Promise<ExecResult>;
 
 /** Async manager for the tags file lifecycle. */
@@ -61,8 +61,17 @@ export interface TagsManager {
   /** Always regenerate the tags file with ctags. */
   regenerate(): Promise<void>;
 
-  /** Get the current tags file status metadata. */
+  /**
+   * Get the current tags file status metadata.
+   */
   getStatus(): TagsStatus;
+
+  /**
+   * Stop the manager for session teardown. Idempotent.
+   * Aborts in-flight work and resolves after queued and active work
+   * settles. An obsolete manager never publishes a tags file.
+   */
+  shutdown(): Promise<void>;
 }
 
 /** Async query backend over a readtags-managed tags file. */

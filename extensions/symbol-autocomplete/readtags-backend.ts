@@ -392,49 +392,126 @@ async function loadKindAliases(
 export function createReadtagsBackend(options: { tagsFilePath: string; cwd: string; readtagsPath?: string }): ReadtagsBackend {
   const { tagsFilePath, cwd, readtagsPath = "readtags" } = options;
 
-  let aliasesPromise: Promise<{ aliases: Map<string, string>; complete: boolean }> | null = null;
-
-  function normalizeLimit(limit: number): number {
-    if (!Number.isFinite(limit)) return MAX_RESULTS;
-    return Math.min(Math.max(Math.trunc(limit), 0), MAX_RESULTS);
+  // One shared kind-alias load. The load has its own AbortController and
+  // its own deadline; callers wait with their own signal and deadline.
+  // The load is cached only when complete (normal EOF or the intentional
+  // alias cap). An incomplete or failed load is never cached and never
+  // reaches a caller's map.
+  interface SharedAliasLoad {
+    controller: AbortController;
+    deadline: number;
+    /** Active waiters on this load. */
+    waiters: number;
+    /** True once the load promise settled. */
+    done: boolean;
+    promise: Promise<{ aliases: Map<string, string>; complete: boolean }>;
   }
 
-  function getAliases(
-    signal: AbortSignal | undefined,
-    deadline: number,
-  ): Promise<{ aliases: Map<string, string>; complete: boolean }> {
-    if (aliasesPromise) return aliasesPromise;
+  let sharedLoad: SharedAliasLoad | null = null;
 
-    aliasesPromise = loadKindAliases(readtagsPath, tagsFilePath, cwd, signal, deadline).then(
+  function getSharedLoad(): SharedAliasLoad {
+    if (sharedLoad !== null) return sharedLoad;
+    const controller = new AbortController();
+    const state: SharedAliasLoad = {
+      controller,
+      deadline: Date.now() + QUERY_TIMEOUT_MS,
+      waiters: 0,
+      done: false,
+      promise: null as unknown as SharedAliasLoad["promise"],
+    };
+    state.promise = loadKindAliases(
+      readtagsPath,
+      tagsFilePath,
+      cwd,
+      controller.signal,
+      state.deadline,
+    ).then(
       (result) => {
-        if (!result.complete) aliasesPromise = null;
+        state.done = true;
+        // An incomplete load must not stay cached for the next caller.
+        if (!result.complete) sharedLoad = null;
         return result;
       },
       (error: unknown) => {
-        aliasesPromise = null;
+        state.done = true;
+        sharedLoad = null;
         throw error;
       },
     );
-    return aliasesPromise;
+    sharedLoad = state;
+    return state;
   }
 
   /**
-   * Load aliases for one query, retrying once after a shared-load
-   * interruption. A partial alias map never reaches a query.
+   * Wait on the shared alias load with one caller's signal and deadline.
+   * The caller's abort or timeout ends only its own wait; the shared
+   * subprocess is aborted only when the final waiter leaves before the
+   * load completes.
+   */
+  function waitForShared(
+    signal: AbortSignal | undefined,
+    deadline: number,
+  ): Promise<
+    | { kind: "left" }
+    | { kind: "result"; result: { aliases: Map<string, string>; complete: boolean } }
+  > {
+    if (signal?.aborted || Date.now() >= deadline) {
+      return Promise.resolve({ kind: "left" });
+    }
+    const state = getSharedLoad();
+    state.waiters += 1;
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const finish = (
+        outcome:
+          | { kind: "left" }
+          | { kind: "result"; result: { aliases: Map<string, string>; complete: boolean } }
+          | { kind: "error"; error: unknown },
+      ) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        state.waiters -= 1;
+        // Abort the shared subprocess only when the final waiter leaves
+        // before the load settles, so no orphan process survives.
+        if (state.waiters === 0 && !state.done) state.controller.abort();
+        if (outcome.kind === "error") reject(outcome.error);
+        else resolve(outcome);
+      };
+      const onAbort = () => finish({ kind: "left" });
+      const timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      state.promise.then(
+        (result) => finish({ kind: "result", result }),
+        (error: unknown) => finish({ kind: "error", error }),
+      );
+    });
+  }
+
+  /**
+   * Load aliases for one caller, retrying once after an incomplete shared
+   * load. Returns null when the caller left (abort or deadline). A partial
+   * alias map never reaches a caller.
    */
   async function loadAliases(
     signal: AbortSignal | undefined,
     deadline: number,
-  ): Promise<Map<string, string>> {
-    const first = await getAliases(signal, deadline);
-    if (first.complete) return first.aliases;
-    // The caller stopped; the caller discards the partial map.
-    if (signal?.aborted || Date.now() >= deadline) return first.aliases;
-    // Another caller aborted the shared load. Retry once with a fresh
-    // load; a still-incomplete load rejects instead of using partial data.
-    const second = await getAliases(signal, deadline);
-    if (second.complete) return second.aliases;
+  ): Promise<Map<string, string> | null> {
+    const first = await waitForShared(signal, deadline);
+    if (first.kind === "left") return null;
+    if (first.result.complete) return first.result.aliases;
+    // The shared load ended incomplete. Retry once with a fresh load while
+    // this caller remains active; a still-incomplete load rejects.
+    const second = await waitForShared(signal, deadline);
+    if (second.kind === "left") return null;
+    if (second.result.complete) return second.result.aliases;
     throw new Error("kind alias loading did not complete");
+  }
+
+  function normalizeLimit(limit: number): number {
+    if (!Number.isFinite(limit)) return MAX_RESULTS;
+    return Math.min(Math.max(Math.trunc(limit), 0), MAX_RESULTS);
   }
 
   async function runQuery(
@@ -447,7 +524,8 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
 
     const deadline = Date.now() + QUERY_TIMEOUT_MS;
     const aliases = await loadAliases(signal, deadline);
-    if (signal?.aborted || Date.now() >= deadline) return;
+    // The caller aborted or its deadline passed during alias loading.
+    if (aliases === null) return;
 
     let scannedLines = 0;
     await streamReadtags(readtagsPath, args, cwd, signal, deadline, (line) => {
@@ -506,7 +584,7 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
       // never reaches the scan.
       const aliases = await loadAliases(signal, deadline);
       // The caller aborted or the deadline passed while aliases loaded.
-      if (signal?.aborted || Date.now() >= deadline) {
+      if (aliases === null) {
         throw new Error(`kind alias loading was interrupted; exact scan of "${name}" aborted`);
       }
 
