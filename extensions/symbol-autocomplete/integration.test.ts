@@ -18,11 +18,19 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import symbolAutocompleteExtension from "./index.ts";
+import { createTagsManager } from "./tags-manager.ts";
+import { createReadtagsBackend } from "./readtags-backend.ts";
+import { createSymbolAutocompleteProvider } from "./autocomplete.ts";
+import { resolveReferences } from "./resolver.ts";
+import { parsePrompt } from "./reference-parser.ts";
+import { buildInjectionPayload } from "./injection.ts";
 
 // The autocomplete provider queries the real `readtags` binary against a
 // fixture tags file. Skip when the binary is not installed.
 const HAS_READTAGS = spawnSync("readtags", ["--version"]).status === 0;
 const SKIP_NO_READTAGS = HAS_READTAGS ? false : "readtags binary not available";
+const HAS_CTAGS = spawnSync("ctags", ["--version"]).status === 0;
+const SKIP_NO_TOOLS = HAS_READTAGS && HAS_CTAGS ? false : "ctags/readtags binary not available";
 
 // ── Mock PI ────────────────────────────────────────────────────────
 
@@ -123,6 +131,39 @@ function classicTagLine(name: string, filePath: string, kind: string, line: numb
   ];
   if (scope) parts.push(`scope:${scope}`);
   return parts.join("\t");
+}
+
+/** Run a command with the actual binaries on PATH (ctags/readtags). */
+function realExecutor(
+  command: string,
+  args: string[],
+  options?: { cwd?: string; timeout?: number },
+): Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> {
+  const result = spawnSync(command, args, {
+    cwd: options?.cwd,
+    encoding: "utf-8",
+    timeout: options?.timeout,
+  });
+  return Promise.resolve({
+    code: result.error ? 127 : (result.status ?? 1),
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    killed: !!result.signal,
+  });
+}
+
+/** A minimal delegating provider; the real backend answers queries here. */
+function createCurrentProvider(): any {
+  return {
+    async getSuggestions() { return null; },
+    applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: any, prefix: string) {
+      const line = lines[cursorLine] ?? "";
+      const start = cursorCol - prefix.length;
+      const nextLines = [...lines];
+      nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
+      return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+    },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -595,6 +636,117 @@ void describe("symbol autocomplete integration", () => {
 
       // No warnings for happy path
       assert.equal(notifyCalls.filter((c) => c.type === "warning").length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("generates a missing tags file with ctags and serves # prefix suggestions", { skip: SKIP_NO_TOOLS }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-generate-"));
+    fs.writeFileSync(path.join(tmpDir, "greeter.ts"), [
+      "export function greet(name: string): string {",
+      "  return `Hello ${name}`;",
+      "}",
+      "",
+      "export class Greeter {",
+      "  greet(name: string): string {",
+      "    return `Hello ${name}`;",
+      "  }",
+      "}",
+    ].join("\n"), "utf-8");
+
+    try {
+      const manager = createTagsManager({ cwd: tmpDir, executor: realExecutor });
+      await manager.ensure();
+
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.ok(fs.existsSync(path.join(tmpDir, "tags")), "ctags must write the tags file");
+
+      // The generated tags serve autocomplete through the real backend.
+      const backend = createReadtagsBackend({
+        tagsFilePath: manager.getStatus().tagsPath,
+        cwd: tmpDir,
+      });
+      const provider = createSymbolAutocompleteProvider(createCurrentProvider(), backend);
+      const suggestions = await provider.getSuggestions(["#gre"], 0, 4, {
+        signal: AbortSignal.timeout(5000),
+      });
+
+      assert.ok(suggestions, "should return suggestions from the generated tags file");
+      assert.equal(suggestions.prefix, "#gre");
+      const labels = suggestions.items.map((item) => item.label);
+      assert.ok(labels.includes("#Greeter"), "class Greeter should be suggested");
+      assert.ok(labels.includes("#greet"), "function greet should be suggested");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("suggests dotted members with a shortened case-insensitive parent prefix (#camp.res)", { skip: SKIP_NO_READTAGS }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-parent-prefix-"));
+    fs.writeFileSync(path.join(tmpDir, "campaign.ts"), [
+      "class Campaign {",
+      "  reservation_date: string;",
+      "  reservation_expiration_date: string;",
+      "  constructor() { this.reservation_date = ''; }",
+      "}",
+    ].join("\n"), "utf-8");
+    fs.writeFileSync(path.join(tmpDir, "tags"), classicTagsFile([
+      classicTagLine("Campaign", "campaign.ts", "class", 1),
+      classicTagLine("reservation_date", "campaign.ts", "property", 2, "class:Campaign"),
+      classicTagLine("reservation_expiration_date", "campaign.ts", "property", 3, "class:Campaign"),
+    ]), "utf-8");
+
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: path.join(tmpDir, "tags"), cwd: tmpDir });
+      const provider = createSymbolAutocompleteProvider(createCurrentProvider(), backend);
+      const suggestions = await provider.getSuggestions(["#camp.res"], 0, 9, {
+        signal: AbortSignal.timeout(5000),
+      });
+
+      assert.ok(suggestions);
+      assert.equal(suggestions.prefix, "#camp.res");
+      assert.equal(suggestions.items[0].label, "#Campaign.reservation_date");
+      assert.equal(suggestions.items[0].value, "#Campaign.reservation_date@campaign.ts:2");
+      assert.equal(suggestions.items[0].description, "Property \u00b7 campaign.ts");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("regenerates tags on rescan and discovers symbols added after a file edit", { skip: SKIP_NO_TOOLS }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-int-regen-"));
+    fs.writeFileSync(path.join(tmpDir, "app.ts"), "class Existing {}\n", "utf-8");
+
+    try {
+      const manager = createTagsManager({ cwd: tmpDir, executor: realExecutor });
+      await manager.ensure();
+      assert.equal(manager.getStatus().engine, "generated");
+
+      // A new symbol appears in the file after the initial build.
+      fs.appendFileSync(path.join(tmpDir, "app.ts"), "class BrandNew {}\n");
+
+      // The stale tags file does not know BrandNew yet: no injection.
+      const backend = createReadtagsBackend({
+        tagsFilePath: manager.getStatus().tagsPath,
+        cwd: tmpDir,
+      });
+      const stale = await resolveReferences(parsePrompt("Use #BrandNew").references, backend);
+      assert.equal(stale.resolved[0].status, "unresolved");
+
+      // /rescan-symbols regenerates the tags file.
+      await manager.regenerate();
+      assert.equal(manager.getStatus().lastError, null);
+
+      // The same turn now resolves and the injection payload builds.
+      const result = await resolveReferences(parsePrompt("Use #BrandNew").references, backend);
+      assert.equal(result.resolved[0].status, "resolved");
+      assert.equal(result.resolved[0].symbol?.name, "BrandNew");
+      assert.equal(result.resolved[0].symbol?.path, "app.ts");
+
+      const injection = await buildInjectionPayload(result.injectable, tmpDir);
+      assert.equal(injection.symbols.length, 1);
+      assert.equal(injection.symbols[0].metadata.name, "BrandNew");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

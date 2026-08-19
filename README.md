@@ -20,18 +20,19 @@ Then run `/reload` in Pi.
 
 ## Usage
 
-Type `#` at the start of a prompt token or after whitespace, then start typing a symbol name. The extension fuzzy-matches definition-level symbols from the current repository, including classes, functions, methods, interfaces, types, enums, and module-level variables/constants.
+Type `#` at the start of a prompt token or after whitespace, then type at least one character of a symbol name. The extension matches symbol names by case-insensitive prefix against the repository `tags` file. It covers classes, functions, methods, interfaces, types, enums, and module-level variables and constants.
 
-Dotted member references let you autocomplete members scoped under a parent symbol. Type
-`#Campaign.reservatio` to find members indexed under `Campaign`:
+Matching is prefix-only. `#crea` finds `createUser` but not `recreate`. There is no fuzzy subsequence matching. A bare `#` delegates to the built-in provider.
+
+The result list is capped at 50 items. The native TUI scrolls the list; the extension adds no custom pages.
+
+Dotted member references autocomplete members scoped under a parent symbol. Type `#Campaign.reservatio` to find members indexed under `Campaign`:
 
 ```text
 #Campaign.reservation_date@src/models/campaign.ts:42
 ```
 
-Dotted references use lexical ctags scope (`Parent.member`). v1 does not perform runtime
-type inference or resolve arbitrary multi-hop chains like `Namespace.Campaign.member`.
-Ast-grep fallback symbols have no parent scope and are not available as dotted references.
+A dotted query needs at least one character after the dot. `#Campaign.` shows nothing. The parent name matches case-insensitively by prefix, so `#camp.res` finds `Campaign.reservation_date`. v1 supports exactly one parent plus one member. Multi-hop chains such as `Namespace.Campaign.member` are not supported.
 
 Selecting a suggestion inserts a stable token:
 
@@ -42,7 +43,7 @@ Selecting a suggestion inserts a stable token:
 Example:
 
 ```text
-Explain #createSymbolIndexManager@extensions/symbol-autocomplete/symbol-index.ts:216
+Explain #createReadtagsBackend@extensions/symbol-autocomplete/readtags-backend.ts:353
 ```
 
 On submit, Pi injects a hidden `symbol-context` message containing the resolved symbol metadata, definition snippet, and bounded surrounding context. The user-authored prompt text is not rewritten.
@@ -58,32 +59,41 @@ References inside triple-backtick fenced code blocks are ignored.
 
 ## Indexing
 
-The index is in memory only. It is rebuilt on session start and via `/rescan-symbols`; it is not stored in a database or session file.
+Symbols are indexed with Universal Ctags into a `tags` file at the repository root (`<repo>/tags`). The tags stay on disk. The extension does not load them into memory.
 
-Index source order:
+At session start, the extension uses an existing `tags` file as-is. When the file is missing, the extension generates it with:
 
-1. Existing `tags` file in the current working directory, when present.
-2. Fresh `ctags --recurse --fields=+K+n --output-format=json .` scan.
-3. `ast-grep` fallback when ctags fails or times out.
+```text
+ctags --recurse --sort=foldcase --fields=+KznZe <default excludes> -f tags .
+```
 
-Indexing is asynchronous and non-blocking. If a prompt is submitted while the index is still building, the turn proceeds without symbol injection and Pi shows a UI-only warning.
+The default excludes skip heavy, vendor, and generated directories such as `.git`, `node_modules`, `dist`, `build`, `.next`, `coverage`, `vendor`, caches, and similar paths.
 
-Default excludes skip heavy/vendor/generated directories such as `.git`, `node_modules`, `dist`, `build`, `.next`, `coverage`, `vendor`, caches, and similar paths.
+`/rescan-symbols` always regenerates the `tags` file with the same command and overwrites the existing file.
+
+The extension requires the Universal Ctags tools `ctags` and `readtags` on `PATH`. When `readtags` is missing or the tags file cannot be read, symbol autocomplete disables with a one-time warning. There is no in-memory fallback index.
+
+Add `tags` to your `.gitignore` so the generated file is not committed. The extension does not edit your `.gitignore` automatically.
+
+## Memory
+
+The tags file stays on disk. Each query runs a `readtags` subprocess whose output is streamed line by line; the output is never buffered whole. Every query enforces hard bounds: a result cap, a scanned-line cap, a byte cap per line, a time cap, and an abort signal. The resolver keeps at most two candidate symbols per reference. Memory use stays bounded. The extension does not promise a specific byte count.
 
 ## Limits
 
+- Max 50 autocomplete results.
 - Max 8 symbol payloads per prompt.
 - About 3000 chars per symbol payload.
 - Truncated payloads include `...[truncated]`.
 - Warnings are shown via Pi UI notifications only; warnings are not injected into the prompt.
-- v1 dotted member references are limited to lexical ctags scope (`Parent.member`). There is no runtime type inference, no arbitrary multi-hop chain resolution, and ast-grep fallback symbols have no parent scope for dotted matching.
+- v1 dotted member references are limited to lexical ctags scope (`Parent.member`). There is no runtime type inference and no arbitrary multi-hop chain resolution.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `/rescan-symbols` | Rebuild the symbol index asynchronously; concurrent scans coalesce. |
-| `/symbol-autocomplete-status` | Show index engine, symbol count, last refresh time, in-flight state, and last error. |
+| `/rescan-symbols` | Regenerate the repository `tags` file asynchronously. Concurrent rescans coalesce into one run. |
+| `/symbol-autocomplete-status` | Show engine, tags path, file size, last modified time, in-flight build state, and last error. The report does not include a symbol count. |
 
 ## Development
 
@@ -93,26 +103,13 @@ Run tests:
 npm test
 ```
 
-The tests use Node's built-in test runner with TypeScript type stripping.
+The tests use Node's built-in test runner with TypeScript type stripping. The integration suite runs the real `ctags` and `readtags` binaries. It skips only when either binary is missing on `PATH`.
 
 ## Requirements
 
 - Pi coding agent - [https://pi.dev/](https://pi.dev/)
-- Universal Ctags recommended (`ctags` on PATH) - [https://github.com/universal-ctags/ctags](https://github.com/universal-ctags/ctags)
+- Universal Ctags (`ctags` and `readtags` on `PATH`) - [https://github.com/universal-ctags/ctags](https://github.com/universal-ctags/ctags)
 
     ```bash
     brew install universal-ctags
-
     ```
-- ast-grep optional fallback (`ast-grep` on PATH) - [https://github.com/ast-grep/ast-grep](https://github.com/ast-grep/ast-grep)
-
-    ```bash
-    brew install ast-grep
-    npm install --g @ast-grep/cli
-    ```
-
-
-## TODO
-
-- [ ] Cap autocomplete results to a reasonable number (e.g. 100).
-- [ ] Measure memory usage for in-memory index and optimize. Consider `readtags` based search.
