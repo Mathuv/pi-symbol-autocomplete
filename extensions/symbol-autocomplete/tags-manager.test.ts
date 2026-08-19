@@ -476,6 +476,77 @@ void describe("tags manager coordinator", () => {
     }
   });
 
+  void it("starts a fresh ctags attempt for a regenerate queued after a later attempt began", { timeout: 5_000 }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    const gates = [deferred(), deferred(), deferred()];
+    try {
+      // No tags file exists, so every request must run ctags.
+      const attemptStarted = [deferred(), deferred(), deferred()];
+      const events: string[] = [];
+      let ctagsRuns = 0;
+      let activeCtags = 0;
+      let maxActiveCtags = 0;
+      const executor: Executor = async (command, args) => {
+        if (command === "readtags") {
+          return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+        }
+        if (command === "ctags") {
+          const attempt = ctagsRuns + 1;
+          ctagsRuns += 1;
+          events.push(`start${attempt}`);
+          attemptStarted[attempt - 1].resolve();
+          activeCtags += 1;
+          maxActiveCtags = Math.max(maxActiveCtags, activeCtags);
+          try {
+            await gates[attempt - 1].promise;
+            if (attempt < 3) {
+              // The first two attempts fail without creating the tags file.
+              return { code: 1, stdout: "", stderr: "boom", killed: false };
+            }
+            writeTagsAt(args);
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          } finally {
+            events.push(`end${attempt}`);
+            activeCtags -= 1;
+          }
+        }
+        return { code: 1, stdout: "", stderr: "", killed: false };
+      };
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const regeneratePromise = manager.regenerate(); // ctags attempt 1, gated
+      await attemptStarted[0].promise;
+      const ensurePromise = manager.ensure(); // queued behind attempt 1
+      gates[0].resolve();
+      await attemptStarted[1].promise; // ensure ctags attempt 2, gated
+      // This request arrived after attempt 2 began. It must queue behind
+      // attempt 2 and run a fresh attempt, not join attempt 2.
+      const secondRegeneratePromise = manager.regenerate();
+
+      // The third request must not start a ctags process while attempt 2
+      // is still gated.
+      assert.deepEqual(events, ["start1", "end1", "start2"]);
+      assert.equal(maxActiveCtags, 1);
+      assert.equal(ctagsRuns, 2);
+      assert.equal(manager.getStatus().isBuilding, true);
+
+      gates[1].resolve();
+      await attemptStarted[2].promise;
+      gates[2].resolve();
+      await Promise.all([ensurePromise, regeneratePromise, secondRegeneratePromise]);
+
+      assert.deepEqual(events, ["start1", "end1", "start2", "end2", "start3", "end3"]);
+      assert.equal(ctagsRuns, 3);
+      assert.equal(maxActiveCtags, 1);
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      // Release every gate so a failed assertion cannot leave gated
+      // promises hanging.
+      for (const gate of gates) gate.resolve();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   void it("shares one failed ctags attempt across concurrent ensures", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
