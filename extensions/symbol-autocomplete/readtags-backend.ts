@@ -501,8 +501,12 @@ export function createReadtagsBackend(options: { tagsFilePath: string; cwd: stri
 
     async scanExact(name, onSymbol, signal) {
       const deadline = Date.now() + QUERY_TIMEOUT_MS;
-      const { aliases, complete } = await getAliases(signal, deadline);
-      if (!complete) {
+      // Route through the shared retry path like the other query methods.
+      // An interrupted shared load is retried once; a partial alias map
+      // never reaches the scan.
+      const aliases = await loadAliases(signal, deadline);
+      // The caller aborted or the deadline passed while aliases loaded.
+      if (signal?.aborted || Date.now() >= deadline) {
         throw new Error(`kind alias loading was interrupted; exact scan of "${name}" aborted`);
       }
 

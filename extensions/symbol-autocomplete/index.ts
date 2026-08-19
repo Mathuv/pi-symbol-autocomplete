@@ -15,6 +15,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { resolve } from "node:path";
 import type { ReadtagsBackend } from "./types.ts";
 import { createTagsManager } from "./tags-manager.ts";
 import { createReadtagsBackend } from "./readtags-backend.ts";
@@ -45,8 +46,9 @@ export default function symbolAutocompleteExtension(
 ) {
   // Shared state — persists across session starts within the same
   // extension runtime (i.e. between `/reload` calls). The manager and
-  // the backend are recreated per session_start so handlers always use
-  // the objects of the current session cwd.
+  // the backend are reused for the same effective tags path, so a
+  // repeated session start coalesces into the in-flight build instead
+  // of racing an independent one. A different path replaces both.
   let indexManager: ReturnType<typeof createTagsManager> | null = null;
   let backend: ReadtagsBackend | null = null;
   let warmup = freshWarmupState();
@@ -67,21 +69,33 @@ export default function symbolAutocompleteExtension(
     // Reset warmup state for the new session
     warmup = freshWarmupState();
 
-    // ── Tags manager (uses pi.exec as the underlying executor) ──
-    indexManager = createTagsManager({
-      cwd: ctx.cwd,
-      executor: (command, args, options) => pi.exec(command, args, options),
-    });
+    // Reuse the current manager/backend only for the exact same effective
+    // tags path. A same-path restart must not spawn a second manager whose
+    // finalizer could overwrite newer tags with an older build.
+    const effectiveTagsPath = resolve(ctx.cwd, "tags");
+    const samePath =
+      indexManager !== null &&
+      backend !== null &&
+      resolve(indexManager.getStatus().tagsPath) === effectiveTagsPath;
+
+    if (!samePath) {
+      // ── Tags manager (uses pi.exec as the underlying executor) ──
+      indexManager = createTagsManager({
+        cwd: ctx.cwd,
+        executor: (command, args, options) => pi.exec(command, args, options),
+      });
+
+      // ── Readtags backend for this session's tags file ───────────
+      const createBackend =
+        options?.createBackend ??
+        ((tagsFilePath: string, cwd: string) => createReadtagsBackend({ tagsFilePath, cwd }));
+      backend = createBackend(indexManager.getStatus().tagsPath, ctx.cwd);
+    }
 
     // ── Async tags ensure (non-blocking) ────────────────────────
-    // Errors are tracked in TagsStatus.
+    // Errors are tracked in TagsStatus. A reused manager coalesces the
+    // in-flight build instead of starting a second one.
     indexManager.ensure().catch(() => {});
-
-    // ── Readtags backend for this session's tags file ───────────
-    const createBackend =
-      options?.createBackend ??
-      ((tagsFilePath: string, cwd: string) => createReadtagsBackend({ tagsFilePath, cwd }));
-    backend = createBackend(indexManager.getStatus().tagsPath, ctx.cwd);
 
     // ── Register autocomplete provider ────────────────────────────
     ctx.ui.addAutocompleteProvider((current) =>

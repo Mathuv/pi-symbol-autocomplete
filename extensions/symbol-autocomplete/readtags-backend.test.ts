@@ -424,6 +424,36 @@ void describe("readtags backend bounds", () => {
     }
   });
 
+  void it("keeps an active exact caller's alias load complete when the first caller aborts", async () => {
+    // P2: scanExact must use the shared retry path. An aborted caller A
+    // must not make active exact caller B reject or scan with partial
+    // aliases.
+    const { dir, tagsPath, command, markerPath } = createReadtagsShim("slow-alias");
+    try {
+      const backend = createReadtagsBackend({ tagsFilePath: tagsPath, cwd: dir, readtagsPath: command });
+      const aController = new AbortController();
+      const bController = new AbortController();
+
+      // A starts the shared alias load; B joins it while the load is in flight.
+      const seen: ProjectSymbol[] = [];
+      const aScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), aController.signal);
+      assert.match(await waitForMarker(markerPath, "D"), /D/);
+      const bScan = backend.scanExact("Aliased", (symbol) => seen.push(symbol), bController.signal);
+
+      // Point B's retry at a tags file that serves a complete alias load,
+      // then abort A. B must not inherit the abort or the partial map.
+      fs.writeFileSync(tagsPath, `alias-symbol\n${markerPath}`);
+      aController.abort();
+
+      await assert.rejects(aScan, /interrupted/);
+      await bScan;
+      assert.deepEqual(seen.map((symbol) => symbol.name), ["Aliased"]);
+      assert.equal(seen[0].kind, "class");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   void it("kills a SIGTERM-ignoring child with SIGKILL after a grace period", async () => {
     const { dir, tagsPath, command, markerPath } = createReadtagsShim("no-term");
     try {

@@ -750,10 +750,146 @@ void describe("symbol autocomplete extension", () => {
         fs.rmSync(dirB, { recursive: true, force: true });
       }
     });
+
+    void it("reuses one manager and backend for a same-cwd restart while the build runs", async () => {
+      // P2: a second session_start for the same effective tags path must
+      // reuse the current manager and backend. Its ensure() joins the
+      // in-flight build, so a second ctags process never runs and no
+      // older finalizer can overwrite newer tags.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-same-"));
+
+      try {
+        // Gate the first ctags generation until both session starts fired.
+        let releaseCtags: () => void = () => {};
+        const ctagsGate = new Promise<void>((resolve) => { releaseCtags = resolve; });
+        let ctagsCalls = 0;
+        let ctagsStarted: () => void = () => {};
+        const ctagsStartedPromise = new Promise<void>((resolve) => { ctagsStarted = resolve; });
+
+        const executor: Executor = async (command: string, args: string[]) => {
+          if (command === "readtags") {
+            return { code: 0, stdout: "Universal Ctags 6.1.0", stderr: "", killed: false };
+          }
+          if (command === "ctags") {
+            ctagsCalls += 1;
+            ctagsStarted();
+            await ctagsGate;
+            const fIndex = args.indexOf("-f");
+            fs.writeFileSync(
+              args[fIndex + 1],
+              "MyService\tservice.ts\t/^class MyService$/;\"\tc\tline:1\n",
+            );
+            return { code: 0, stdout: "", stderr: "", killed: false };
+          }
+          return { code: 0, stdout: "", stderr: "", killed: false };
+        };
+
+        const pi = createMockPi(executor);
+        const backends: Array<{ tagsFilePath: string; cwd: string; queries: string[] }> = [];
+        const providerFactories: Array<(current: unknown) => unknown> = [];
+        const createBackend = (tagsFilePath: string, cwd: string) => {
+          const record = { tagsFilePath, cwd, queries: [] as string[] };
+          backends.push(record);
+          return {
+            queryPrefix: async (query: string) => {
+              record.queries.push(query);
+              return [{ name: "MyService", kind: "class", path: "service.ts", line: 1 }];
+            },
+            queryDotted: async () => [],
+            scanExact: async () => {},
+          };
+        };
+        symbolAutocompleteExtension(pi as unknown as ExtensionAPI, { createBackend });
+
+        const sessionStartHandler = pi.handlers.get("session_start") as
+          | ((event: unknown, ctx: ExtensionCommandContext) => void)
+          | undefined;
+        assert.ok(sessionStartHandler);
+
+        const makeSessionCtx = (cwd: string) =>
+          createMockCtx({
+            cwd,
+            ui: {
+              addAutocompleteProvider: (factory: (current: unknown) => unknown) => {
+                providerFactories.push(factory);
+              },
+            },
+          });
+
+        // First session start: the tags build starts and is gated on ctags.
+        sessionStartHandler?.({}, makeSessionCtx(tmpDir));
+        await ctagsStartedPromise;
+
+        // Second session start for the same cwd while the build is in flight.
+        sessionStartHandler?.({}, makeSessionCtx(tmpDir));
+
+        // Release the build. The reused manager's ensure() must coalesce.
+        releaseCtags();
+        await waitForTagsFile(path.join(tmpDir, "tags"));
+
+        assert.equal(ctagsCalls, 1, "both session starts share one ctags process");
+        assert.equal(backends.length, 1, "the same-path restart reuses the backend");
+        assert.equal(providerFactories.length, 2, "each session registers its own provider");
+
+        // The published tags file is the single build's output.
+        assert.match(fs.readFileSync(path.join(tmpDir, "tags"), "utf8"), /MyService/);
+
+        // The second editor's provider must query the reused backend.
+        const provider = providerFactories[1]({
+          async getSuggestions() {
+            return null;
+          },
+          applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: { value: string }, prefix: string) {
+            const line = lines[cursorLine] ?? "";
+            const start = cursorCol - prefix.length;
+            const nextLines = [...lines];
+            nextLines[cursorLine] = line.slice(0, start) + item.value + line.slice(cursorCol);
+            return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+          },
+          shouldTriggerFileCompletion() {
+            return true;
+          },
+        }) as { getSuggestions: (lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal }) => Promise<{ prefix: string } | null> };
+        const suggestions = await provider.getSuggestions(["#MySer"], 0, 6, {
+          signal: AbortSignal.timeout(1000),
+        });
+        assert.ok(suggestions, "the second provider must return suggestions");
+        assert.equal(suggestions.prefix, "#MySer");
+        assert.deepEqual(backends[0].queries, ["MySer"], "the second provider must query the reused backend");
+
+        // Command hooks must use the reused current manager.
+        const statusHandler = pi.commands.get("symbol-autocomplete-status") as
+          | ((args: string, ctx: ExtensionCommandContext) => Promise<void>)
+          | undefined;
+        assert.ok(statusHandler);
+        const statusNotify: Array<{ message: string; type: string }> = [];
+        const statusCtx = createMockCtx({
+          cwd: tmpDir,
+          ui: { notify: (msg, type) => statusNotify.push({ message: msg, type }) },
+        });
+        await statusHandler("", statusCtx as any);
+        assert.equal(statusNotify.length, 1);
+        assert.ok(
+          statusNotify[0].message.includes(path.resolve(tmpDir, "tags")),
+          "status must report the reused manager's tags path",
+        );
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
   });
 });
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/** Wait until the tags file exists at `tagsPath`. */
+async function waitForTagsFile(tagsPath: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (fs.existsSync(tagsPath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`tags file never appeared at ${tagsPath}`);
+}
 
 function createPromptEventPartial() {
   return {
