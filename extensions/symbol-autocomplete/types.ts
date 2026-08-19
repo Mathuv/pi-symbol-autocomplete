@@ -78,6 +78,24 @@ export interface SymbolIndexManager {
   getStatus(): IndexStatus;
 }
 
+/** Async query backend over a readtags-managed tags file. */
+export interface ReadtagsBackend {
+  /**
+   * Prefix-search symbols by name. Case-insensitive.
+   * Results are capped at `limit` (at most 50).
+   */
+  queryPrefix(query: string, limit: number, signal?: AbortSignal): Promise<ProjectSymbol[]>;
+
+  /**
+   * Search members whose parent name matches `parentQuery` by
+   * case-insensitive prefix. Exact parent matches rank first.
+   */
+  queryDotted(parentQuery: string, memberQuery: string, limit: number, signal?: AbortSignal): Promise<ProjectSymbol[]>;
+
+  /** Look up symbols by exact name. Results are capped at `limit` (at most 50). */
+  lookupExact(name: string, limit?: number): Promise<ProjectSymbol[]>;
+}
+
 /** Default directory exclude patterns. */
 export const DEFAULT_EXCLUDES = [
   ".git",
