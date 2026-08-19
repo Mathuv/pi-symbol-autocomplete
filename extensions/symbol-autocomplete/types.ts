@@ -40,7 +40,7 @@ export interface ExecResult {
   code: number;
   stdout: string;
   stderr: string;
-  killed?: boolean;
+  killed: boolean;
 }
 
 /** Executor function type, abstracts pi.exec() or test mock. */

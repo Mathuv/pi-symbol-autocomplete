@@ -8,6 +8,7 @@
  * - ctags failure with no tags file → engine `none`
  * - regenerate() always runs ctags
  * - Concurrent ensure() calls coalesce into one build
+ * - Coordinator: one ctags process at a time, join semantics, isBuilding
  */
 
 import { describe, it } from "node:test";
@@ -24,13 +25,26 @@ const SAMPLE_TAGS = [
   "MyService\tsrc/service.ts\t/^class MyService$/;\"\tc\tline:4",
 ].join("\n") + "\n";
 
+/** A promise resolved manually by the test. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 interface MockOptions {
   readtagsCode?: number;
+  readtagsKilled?: boolean;
   ctagsCode?: number;
   ctagsStderr?: string;
   ctagsKilled?: boolean;
   ctagsThrows?: boolean;
-  delayMs?: number;
+  /** ctags waits on this gate before producing its result. */
+  ctagsGate?: { promise: Promise<void> };
+  /** Called when the ctags executor is entered, before the gate. */
+  onCtagsStart?: () => void;
   /** Runs before a ctags result is returned. Use to create the tags file. */
   onCtags?: (args: string[]) => void;
 }
@@ -38,34 +52,42 @@ interface MockOptions {
 function createMockExecutor(options: MockOptions = {}): {
   executor: Executor;
   calls: Array<{ command: string; args: string[] }>;
+  tracker: { activeCtags: number; maxActiveCtags: number };
 } {
   const calls: Array<{ command: string; args: string[] }> = [];
+  const tracker = { activeCtags: 0, maxActiveCtags: 0 };
   const executor: Executor = async (command, args, _execOptions) => {
     calls.push({ command, args });
-    if (options.delayMs) {
-      await new Promise((resolve) => setTimeout(resolve, options.delayMs));
-    }
     if (command === "readtags") {
       return {
         code: options.readtagsCode ?? 0,
         stdout: "Universal Ctags 6.1.0",
         stderr: "",
+        killed: options.readtagsKilled ?? false,
       };
     }
     if (command === "ctags") {
-      options.onCtags?.(args);
-      if (options.ctagsThrows) throw new Error("spawn ctags ENOENT");
-      return {
-        code: options.ctagsCode ?? 0,
-        stdout: "",
-        stderr: options.ctagsStderr ?? "",
-        killed: options.ctagsKilled,
-      };
+      options.onCtagsStart?.();
+      tracker.activeCtags += 1;
+      tracker.maxActiveCtags = Math.max(tracker.maxActiveCtags, tracker.activeCtags);
+      try {
+        if (options.ctagsGate) await options.ctagsGate.promise;
+        options.onCtags?.(args);
+        if (options.ctagsThrows) throw new Error("spawn ctags ENOENT");
+        return {
+          code: options.ctagsCode ?? 0,
+          stdout: "",
+          stderr: options.ctagsStderr ?? "",
+          killed: options.ctagsKilled ?? false,
+        };
+      } finally {
+        tracker.activeCtags -= 1;
+      }
     }
     // pi.exec resolves missing executables; it does not reject.
     return { code: 1, stdout: "", stderr: "", killed: false };
   };
-  return { executor, calls };
+  return { executor, calls, tracker };
 }
 
 /** Write a sample tags file into the directory. Returns the file path. */
@@ -147,6 +169,18 @@ void describe("tags manager ensure()", () => {
 
   void it("disables with an install hint when the readtags probe fails", async () => {
     const { executor, calls } = createMockExecutor({ readtagsCode: 1 });
+
+    const manager = createTagsManager({ cwd: "/project", executor });
+    await manager.ensure();
+
+    const status = manager.getStatus();
+    assert.equal(status.engine, "none");
+    assert.match(status.lastError ?? "", /readtags not found.*install universal-ctags/);
+    assert.equal(calls.filter((c) => c.command === "ctags").length, 0);
+  });
+
+  void it("disables with an install hint when the readtags probe is killed", async () => {
+    const { executor, calls } = createMockExecutor({ readtagsKilled: true });
 
     const manager = createTagsManager({ cwd: "/project", executor });
     await manager.ensure();
@@ -255,12 +289,15 @@ void describe("tags manager ensure()", () => {
     }
   });
 
-  void it("regenerate() joins an in-flight ensure() generation", async () => {
+  void it("regenerate() joins an in-flight ensure() generation", { timeout: 5_000 }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
+      const ctagsGate = deferred();
+      const started = deferred();
       let ctagsRuns = 0;
       const { executor } = createMockExecutor({
-        delayMs: 20,
+        ctagsGate,
+        onCtagsStart: () => started.resolve(),
         onCtags: (args) => {
           ctagsRuns += 1;
           writeTagsAt(args);
@@ -268,52 +305,57 @@ void describe("tags manager ensure()", () => {
       });
 
       const manager = createTagsManager({ cwd: tmpDir, executor });
-      let buildingWhileRegenerateQueued: boolean | null = null;
-      const ensurePromise = manager.ensure().then(() => {
-        buildingWhileRegenerateQueued = manager.getStatus().isBuilding;
-      });
+      const ensurePromise = manager.ensure();
       const regeneratePromise = manager.regenerate();
+
+      await started.promise;
+      assert.equal(manager.getStatus().isBuilding, true);
+      ctagsGate.resolve();
       await Promise.all([ensurePromise, regeneratePromise]);
 
       assert.equal(ctagsRuns, 1);
-      assert.equal(buildingWhileRegenerateQueued, true);
       assert.equal(manager.getStatus().engine, "generated");
       assert.equal(manager.getStatus().isBuilding, false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, { timeout: 5_000 });
 
-  void it("regenerate() queues after an ensure() that finds an existing file", async () => {
+  void it("regenerate() queues after an ensure() that finds an existing file", { timeout: 5_000 }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
     try {
-      let ctagsRuns = 0;
-      const { executor } = createMockExecutor({
-        delayMs: 20,
-        onCtags: (args) => {
-          ctagsRuns += 1;
-          writeTagsAt(args);
-        },
-      });
-
       writeSampleTags(tmpDir);
-      const manager = createTagsManager({ cwd: tmpDir, executor });
-      const states: string[] = [];
-      const ensurePromise = manager.ensure().then(() => {
-        states.push(manager.getStatus().isBuilding ? "building" : "settled");
+      const ctagsGate = deferred();
+      const started = deferred();
+      let ctagsRuns = 0;
+      const { executor } = createMockExecutor({
+        ctagsGate,
+        onCtagsStart: () => started.resolve(),
+        onCtags: (args) => {
+          ctagsRuns += 1;
+          writeTagsAt(args);
+        },
       });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const ensurePromise = manager.ensure();
       const regeneratePromise = manager.regenerate();
+
+      // The regenerate's ctags runs only after the ensure settled: the
+      // engine still says tags-file while the ctags process is gated.
+      await started.promise;
+      assert.equal(manager.getStatus().engine, "tags-file");
+      assert.equal(manager.getStatus().isBuilding, true);
+      ctagsGate.resolve();
       await Promise.all([ensurePromise, regeneratePromise]);
-      states.push(manager.getStatus().isBuilding ? "building" : "settled");
 
       assert.equal(ctagsRuns, 1);
       assert.equal(manager.getStatus().engine, "generated");
       assert.equal(manager.getStatus().isBuilding, false);
-      assert.deepEqual(states, ["building", "settled"]);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, { timeout: 5_000 });
 
   void it("keeps an existing file with a tags-file engine when regeneration fails", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
@@ -340,7 +382,6 @@ void describe("tags manager ensure()", () => {
     try {
       let ctagsRuns = 0;
       const { executor } = createMockExecutor({
-        delayMs: 20,
         onCtags: (args) => {
           ctagsRuns += 1;
           writeTagsAt(args);
@@ -351,6 +392,115 @@ void describe("tags manager ensure()", () => {
       await Promise.all([manager.ensure(), manager.ensure(), manager.ensure()]);
 
       assert.equal(ctagsRuns, 1);
+      assert.equal(manager.getStatus().engine, "generated");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── coordinator serialization ───────────────────────────────────────
+
+void describe("tags manager coordinator", () => {
+  void it("never runs two ctags processes and keeps isBuilding true with three queued requests", { timeout: 5_000 }, async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      writeSampleTags(tmpDir);
+      const ctagsGate = deferred();
+      const started = deferred();
+      let ctagsRuns = 0;
+      const { executor, tracker } = createMockExecutor({
+        ctagsGate,
+        onCtagsStart: () => started.resolve(),
+        onCtags: (args) => {
+          ctagsRuns += 1;
+          writeTagsAt(args);
+        },
+      });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      const ensurePromise = manager.ensure(); // finds the existing file, no ctags
+      const regeneratePromise = manager.regenerate(); // runs ctags, gated
+      await ensurePromise;
+      // A third distinct request queues behind the active regenerate.
+      const thirdPromise = manager.ensure();
+
+      // The regenerate's ctags is in flight and the third request is queued.
+      await started.promise;
+      assert.equal(manager.getStatus().isBuilding, true);
+      assert.equal(tracker.maxActiveCtags, 1);
+
+      ctagsGate.resolve();
+      await Promise.all([regeneratePromise, thirdPromise]);
+
+      assert.equal(ctagsRuns, 1);
+      assert.equal(tracker.maxActiveCtags, 1);
+      assert.equal(manager.getStatus().engine, "generated");
+      assert.equal(manager.getStatus().isBuilding, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, { timeout: 5_000 });
+
+  void it("shares one failed ctags attempt across concurrent ensures", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor, calls } = createMockExecutor({ ctagsCode: 1, ctagsStderr: "boom" });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await Promise.all([manager.ensure(), manager.ensure(), manager.ensure()]);
+
+      assert.equal(calls.filter((c) => c.command === "ctags").length, 1);
+      assert.equal(manager.getStatus().engine, "none");
+      assert.match(manager.getStatus().lastError ?? "", /boom/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("shares one failed ctags attempt across concurrent regenerates", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor, calls } = createMockExecutor({ ctagsCode: 1, ctagsStderr: "boom" });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await Promise.all([manager.regenerate(), manager.regenerate(), manager.regenerate()]);
+
+      assert.equal(calls.filter((c) => c.command === "ctags").length, 1);
+      assert.equal(manager.getStatus().engine, "none");
+      assert.match(manager.getStatus().lastError ?? "", /boom/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("runs one failed ctags attempt for a missing-file ensure with a queued regenerate", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor, calls } = createMockExecutor({ ctagsCode: 1, ctagsStderr: "boom" });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await Promise.all([manager.ensure(), manager.regenerate()]);
+
+      assert.equal(calls.filter((c) => c.command === "ctags").length, 1);
+      assert.equal(manager.getStatus().engine, "none");
+      assert.match(manager.getStatus().lastError ?? "", /boom/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("makes a fresh ctags attempt for each later non-concurrent regenerate", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sym-tm-"));
+    try {
+      const { executor, calls } = createMockExecutor({ onCtags: writeTagsAt });
+
+      const manager = createTagsManager({ cwd: tmpDir, executor });
+      await manager.ensure();
+      await manager.regenerate();
+      await manager.regenerate();
+
+      assert.equal(calls.filter((c) => c.command === "ctags").length, 3);
       assert.equal(manager.getStatus().engine, "generated");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

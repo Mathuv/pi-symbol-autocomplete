@@ -10,12 +10,12 @@
  * the engine becomes `none` and the feature disables with an install hint.
  * There is no in-memory fallback (decision 6 in the plan).
  *
- * One operation coordinator guards all work. Concurrent `ensure()` calls
- * coalesce, concurrent `regenerate()` calls coalesce, and the two APIs
- * never run ctags concurrently. When `ensure()` is generating a missing
- * file, a queued `regenerate()` joins that generation (one ctags command).
- * When `ensure()` only probes and finds an existing file, a queued
- * `regenerate()` runs its own ctags command after it.
+ * One operation coordinator guards all work. The queue tail is a permanent
+ * promise chain, so operations never overlap and no older finalizer can
+ * clear a newer request. Same-kind concurrent calls share one promise,
+ * including failures. A queued request joins a ctags attempt that started
+ * after it was scheduled, so a `regenerate()` behind a generating `ensure()`
+ * shares one ctags command.
  */
 
 import { stat } from "node:fs/promises";
@@ -67,18 +67,30 @@ export function createTagsManager(options: {
   };
 
   let probeResult: Promise<boolean> | null = null;
-  // Serializes operations: each op runs only after the previous settles.
-  let inFlight: Promise<void> | null = null;
-  // Number of queued and active ops. isBuilding stays true until this is 0.
-  let pendingOps = 0;
-  // True after a successful generation. Queued ops join that generation.
-  // The coordinator clears it when the queue drains.
-  let generatedInQueue = false;
+  // Permanent queue tail. Each distinct request runs only after the
+  // previous request settles, so ctags processes never overlap.
+  let tail: Promise<void> = Promise.resolve();
+  // Distinct in-flight or queued ensure request. Same-kind calls join it.
+  let ensureRequest: Promise<void> | null = null;
+  // Distinct in-flight or queued regenerate request. Same-kind calls join it.
+  let regenerateRequest: Promise<void> | null = null;
+  // Number of distinct queued and active requests. isBuilding stays true
+  // until this is 0. Coalesced callers do not increment it.
+  let pendingDistinct = 0;
+  // Monotonic ctags attempt counter. Incremented before every ctags
+  // executor call. A request whose observed count is stale at execution
+  // time joins the intervening attempt.
+  let ctagsAttemptId = 0;
 
   /** Probe readtags once per manager instance. */
   function probeReadtags(): Promise<boolean> {
     probeResult ??= executor("readtags", ["--version"], { cwd, timeout: PROBE_TIMEOUT_MS }).then(
-      (result) => result.code === 0,
+      (result) => {
+        // pi.exec resolves a killed run with code 0. A killed probe must
+        // disable the feature like a missing readtags.
+        if (result.killed) return false;
+        return result.code === 0;
+      },
       () => false,
     );
     return probeResult;
@@ -106,11 +118,9 @@ export function createTagsManager(options: {
   async function recordOutcome(lastError: string | null): Promise<void> {
     const info = await statTags();
     if (info === null) {
-      generatedInQueue = false;
       status = { ...status, engine: "none", fileSizeBytes: 0, mtime: null, lastError };
       return;
     }
-    generatedInQueue = lastError === null;
     status = {
       ...status,
       engine: lastError === null ? "generated" : "tags-file",
@@ -132,6 +142,9 @@ export function createTagsManager(options: {
       ".",
     ];
 
+    // A queued request uses this count to join this attempt.
+    ctagsAttemptId += 1;
+
     let result: ExecResult;
     try {
       result = await executor("ctags", args, { cwd, timeout: ctagsTimeout });
@@ -142,7 +155,7 @@ export function createTagsManager(options: {
 
     // pi.exec resolves a killed run with code 0. A killed ctags must never
     // mark the file as generated, even when a partial file exists.
-    if (result.killed === true) {
+    if (result.killed) {
       await recordOutcome("ctags timed out");
       return;
     }
@@ -154,17 +167,18 @@ export function createTagsManager(options: {
     await recordOutcome(null);
   }
 
-  /** One uncoordinated ensure. The coordinator guards concurrency. */
-  async function runEnsure(): Promise<void> {
+  /**
+   * One uncoordinated ensure. The coordinator guards concurrency.
+   * Joins a ctags attempt that started after this request was scheduled.
+   */
+  async function runEnsure(observedAttempt: number): Promise<void> {
+    if (ctagsAttemptId !== observedAttempt) return;
     status = { ...status, lastError: null };
     try {
       if (!(await probeReadtags())) {
         status = { ...status, engine: "none", lastError: READTAGS_NOT_FOUND };
         return;
       }
-      // Join a generation the preceding op just completed.
-      if (generatedInQueue) return;
-
       const info = await statTags();
       if (info !== null) {
         status = {
@@ -182,45 +196,59 @@ export function createTagsManager(options: {
     }
   }
 
-  /** One uncoordinated regenerate. The coordinator guards concurrency. */
-  async function runRegenerate(): Promise<void> {
+  /**
+   * One uncoordinated regenerate. The coordinator guards concurrency.
+   * Joins a ctags attempt that started after this request was scheduled.
+   */
+  async function runRegenerate(observedAttempt: number): Promise<void> {
+    if (ctagsAttemptId !== observedAttempt) return;
     status = { ...status, lastError: null };
     try {
       if (!(await probeReadtags())) {
         status = { ...status, engine: "none", lastError: READTAGS_NOT_FOUND };
         return;
       }
-      // Join a generation the preceding op just completed.
-      if (generatedInQueue) return;
       await runCtags();
     } catch (err: unknown) {
       status = { ...status, engine: "none", lastError: err instanceof Error ? err.message : String(err) };
     }
   }
 
-  /** Operation coordinator. Queued ops run after the active op settles. */
-  function coordinate(op: () => Promise<void>): Promise<void> {
-    pendingOps += 1;
+  /**
+   * Operation coordinator. Queued requests run after the active request
+   * settles. Same-kind concurrent calls share one promise, including
+   * failures. Each finalizer clears its own request pointer only.
+   */
+  function coordinate(kind: "ensure" | "regenerate"): Promise<void> {
+    if (kind === "ensure" && ensureRequest !== null) return ensureRequest;
+    if (kind === "regenerate" && regenerateRequest !== null) return regenerateRequest;
+
+    pendingDistinct += 1;
     status = { ...status, isBuilding: true };
-    const run = inFlight ? inFlight.then(op, op) : op();
-    const tracked = run.finally(() => {
-      inFlight = null;
-      pendingOps -= 1;
-      if (pendingOps === 0) {
-        generatedInQueue = false;
-        status = { ...status, isBuilding: false };
-      }
-    });
-    inFlight = tracked;
-    return tracked;
+    const observedAttempt = ctagsAttemptId;
+    const run = kind === "ensure" ? () => runEnsure(observedAttempt) : () => runRegenerate(observedAttempt);
+    // The settled chain cannot reject, so a failure never poisons the tail.
+    const request = tail.then(run, run).then(finish, finish);
+    tail = request;
+    if (kind === "ensure") ensureRequest = request;
+    else regenerateRequest = request;
+    return request;
+
+    function finish(): void {
+      pendingDistinct -= 1;
+      // Clear only when this finalizer still owns the request pointer.
+      if (ensureRequest === request) ensureRequest = null;
+      if (regenerateRequest === request) regenerateRequest = null;
+      if (pendingDistinct === 0) status = { ...status, isBuilding: false };
+    }
   }
 
   function ensure(): Promise<void> {
-    return coordinate(runEnsure);
+    return coordinate("ensure");
   }
 
   function regenerate(): Promise<void> {
-    return coordinate(runRegenerate);
+    return coordinate("regenerate");
   }
 
   function getStatus(): TagsStatus {
